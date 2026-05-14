@@ -1,0 +1,113 @@
+body {
+    background-color: #f5f7fa;
+}
+
+.navbar-brand {
+    letter-spacing: 0.5px;
+}
+
+.card {
+    border: none;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+    border-radius: 12px;
+}
+
+.card-header {
+    background-color: transparent;
+    border-bottom: 1px solid rgba(0,0,0,0.06);
+    font-size: 1rem;
+    padding: 1rem 1.25rem;
+}
+
+.card-body {
+    padding: 1.25rem;
+}
+
+.card.bg-danger, .card.bg-success, .card.bg-primary {
+    border-radius: 12px;
+}
+
+.card.bg-danger h3,
+.card.bg-success h3,
+.card.bg-primary h3 {
+    font-weight: 700;
+    margin-bottom: 0;
+}
+
+.progress {
+    border-radius: 10px;
+    background-color: #e9ecef;
+}
+
+.table > :not(caption) > * > * {
+    vertical-align: middle;
+}
+
+.form-switch .form-check-input:checked {
+    background-color: #28a745;
+    border-color: #28a745;
+}
+
+/* Floating Chat Widget */
+#chat-widget {
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    z-index: 1050;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+}
+
+.chat-bubble {
+    width: 52px;
+    height: 52px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 700;
+    font-size: 1rem;
+    cursor: pointer;
+    border: none;
+    transition: transform 0.15s;
+}
+
+.chat-bubble:hover {
+    transform: scale(1.1);
+}
+
+#chat-popup {
+    position: absolute;
+    bottom: 64px;
+    right: 0;
+    width: 360px;
+    max-height: 480px;
+    border-radius: 12px;
+    overflow: hidden;
+    display: none;
+}
+
+.chat-msg-area {
+    height: 280px;
+    overflow-y: auto;
+    scroll-behavior: smooth;
+}
+
+.chat-msg-area .badge {
+    line-height: 1.5;
+    font-size: 0.875rem;
+}
+
+@media (max-width: 576px) {
+    #chat-popup {
+        width: calc(100vw - 48px);
+        right: 0;
+    }
+
+    .card.bg-danger h3,
+    .card.bg-success h3,
+    .card.bg-primary h3 {
+        font-size: 1.5rem;
+    }
+}

@@ -1,0 +1,223 @@
+{% extends "base.html" %}
+{% block title %}Expenses - Personal Finance{% endblock %}
+{% block content %}
+
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h3>AI-Powered Expenses</h3>
+    <form method="GET" action="/expenses" class="d-flex align-items-center gap-2">
+        <label class="fw-bold small">Month:</label>
+        <select name="month" class="form-select form-select-sm" onchange="this.form.submit()" style="width:auto;">
+            {% for m in months %}
+            <option value="{{ m }}" {{ 'selected' if m == selected_month else '' }}>{{ m }}</option>
+            {% endfor %}
+        </select>
+    </form>
+</div>
+
+<div class="row g-3 mb-4">
+    <div class="col-md-4">
+        <div class="card bg-danger text-white h-100" id="summary-expenses">
+            <div class="card-body">
+                <h6 class="small text-uppercase opacity-75">Regular Expenses</h6>
+                <h3>{{ format_currency(summary.total_expenses) }}</h3>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card bg-success text-white h-100" id="summary-assets">
+            <div class="card-body">
+                <h6 class="small text-uppercase opacity-75">Assets & Investments</h6>
+                <h3>{{ format_currency(summary.total_assets) }}</h3>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card bg-primary text-white h-100" id="summary-deducted">
+            <div class="card-body">
+                <h6 class="small text-uppercase opacity-75">Total Deducted</h6>
+                <h3>{{ format_currency(summary.total_deducted) }}</h3>
+            </div>
+        </div>
+    </div>
+</div>
+
+{% if breakdown %}
+<div class="card mb-4">
+    <div class="card-header"><strong>Category Breakdown</strong></div>
+    <div class="card-body">
+        {% set total = summary.total_deducted if summary.total_deducted > 0 else 1 %}
+        {% for item in breakdown %}
+        <div class="mb-3">
+            <div class="d-flex justify-content-between small mb-1">
+                <span>{{ item.name }}{% if item.is_asset %} <span class="badge bg-success">Asset</span>{% endif %}</span>
+                <span>{{ format_currency(item.total) }} ({{ item.percentage }}%)</span>
+            </div>
+            <div class="progress" style="height:22px;">
+                <div class="progress-bar {% if item.is_asset %}bg-success{% else %}bg-info{% endif %} fw-bold"
+                     style="width:{{ item.percentage }}%;" role="progressbar">
+                    {{ item.percentage }}%
+                </div>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+</div>
+{% endif %}
+
+<div class="card mb-4">
+    <div class="card-header"><strong>AI Natural Language Input</strong></div>
+    <div class="card-body">
+        <textarea id="nl-input" class="form-control mb-2" rows="2"
+            placeholder='"Groceries for 250 AED" or "Gold bars for 5000 AED"'></textarea>
+        <div class="d-flex gap-2 flex-wrap">
+            <button id="btn-analyze" class="btn btn-primary">Analyze with AI</button>
+            <button id="btn-scan-invoice" class="btn btn-outline-secondary">Scan Invoice</button>
+            <input type="file" id="invoice-file-input" accept="image/*" style="display:none">
+        </div>
+        <div id="ai-status" class="mt-2 small text-muted fst-italic"></div>
+    </div>
+</div>
+
+<div class="card mb-4">
+    <div class="card-header"><strong>Expense Details</strong></div>
+    <div class="card-body">
+        <form method="POST" action="/expenses/add" enctype="multipart/form-data">
+            <div class="row g-3">
+                <div class="col-md-6">
+                    <label class="form-label">Item Name</label>
+                    <input type="text" name="item_name" id="field-item_name" class="form-control" maxlength="200" required>
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label">Amount (AED)</label>
+                    <input type="number" name="amount" id="field-amount" class="form-control" step="0.01" min="0.01" required>
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label">Category</label>
+                    <select name="category_id" id="field-category" class="form-select">
+                        {% for c in categories %}
+                        <option value="{{ c.id }}">{{ c.name }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="col-md-4">
+                    <label class="form-label">Date</label>
+                    <input type="date" name="transaction_date" class="form-control" value="{{ today }}">
+                </div>
+                <div class="col-md-8">
+                    <label class="form-label">Notes</label>
+                    <input type="text" name="notes" class="form-control" maxlength="500" placeholder="Optional notes...">
+                </div>
+                <div class="col-md-6">
+                    <label class="form-label">Invoice Image (Optional)</label>
+                    <input type="file" name="invoice" class="form-control" accept="image/*">
+                </div>
+                <div class="col-md-6 d-flex align-items-center">
+                    <div class="form-check form-switch">
+                        <input class="form-check-input" type="checkbox" name="is_asset" id="asset-toggle" value="1">
+                        <label class="form-check-label fw-bold" for="asset-toggle">This is an Asset / Investment</label>
+                    </div>
+                </div>
+            </div>
+            <div class="mt-3 d-flex gap-2">
+                <button type="submit" class="btn btn-success">Save Expense</button>
+                <button type="reset" class="btn btn-outline-secondary">Clear Form</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header"><strong>Transaction History</strong></div>
+    <div class="card-body p-0">
+        {% if transactions %}
+        <div class="table-responsive">
+            <table class="table table-hover mb-0">
+                <thead class="table-dark">
+                    <tr>
+                        <th>#</th>
+                        <th>Item</th>
+                        <th>Amount</th>
+                        <th>Category</th>
+                        <th>Date</th>
+                        <th>Type</th>
+                        <th class="text-end">Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for t in transactions %}
+                    <tr data-id="{{ t.id }}" data-item="{{ t.item_name }}" data-amount="{{ t.amount }}"
+                        data-category="{{ t.category_id }}" data-date="{{ t.transaction_date }}"
+                        data-notes="{{ t.notes or '' }}" data-asset="{{ t.is_asset }}">
+                        <td>{{ t.id }}</td>
+                        <td>{{ t.item_name }}{% if t.notes %} <span class="text-muted small">({{ t.notes }})</span>{% endif %}</td>
+                        <td>{{ format_currency(t.amount) }}</td>
+                        <td><span class="badge bg-light text-dark">{{ t.category_name }}</span></td>
+                        <td>{{ t.transaction_date }}</td>
+                        <td>{% if t.is_asset %}<span class="badge bg-success">Asset</span>{% else %}<span class="badge bg-secondary">Expense</span>{% endif %}</td>
+                        <td class="text-end">
+                            <button class="btn btn-sm btn-outline-primary edit-expense-btn" data-bs-toggle="modal" data-bs-target="#editExpenseModal">Edit</button>
+                            <button class="btn btn-sm btn-outline-danger delete-expense-btn" data-id="{{ t.id }}">Delete</button>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <div class="card-body"><p class="text-muted mb-0">No transactions for this month.</p></div>
+        {% endif %}
+    </div>
+</div>
+
+<!-- Edit Expense Modal -->
+<div class="modal fade" id="editExpenseModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Edit Expense</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <form method="POST" id="edit-expense-form">
+                <div class="modal-body">
+                    <input type="hidden" name="expense_id" id="edit-expense-id">
+                    <div class="mb-3">
+                        <label class="form-label">Item Name</label>
+                        <input type="text" name="item_name" id="edit-item-name" class="form-control" maxlength="200" required>
+                    </div>
+                    <div class="row mb-3">
+                        <div class="col-6">
+                            <label class="form-label">Amount (AED)</label>
+                            <input type="number" name="amount" id="edit-amount" class="form-control" step="0.01" min="0.01" required>
+                        </div>
+                        <div class="col-6">
+                            <label class="form-label">Category</label>
+                            <select name="category_id" id="edit-category" class="form-select">
+                                {% for c in categories %}
+                                <option value="{{ c.id }}">{{ c.name }}</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Date</label>
+                        <input type="date" name="transaction_date" id="edit-date" class="form-control">
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Notes</label>
+                        <input type="text" name="notes" id="edit-notes" class="form-control" maxlength="500">
+                    </div>
+                    <div class="form-check form-switch">
+                        <input class="form-check-input" type="checkbox" name="is_asset" id="edit-asset-toggle" value="1">
+                        <label class="form-check-label" for="edit-asset-toggle">This is an Asset / Investment</label>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Save Changes</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+{% endblock %}

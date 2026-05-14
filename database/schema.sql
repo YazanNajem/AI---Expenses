@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS tutoring_sessions (
     amount_due REAL NOT NULL CHECK(amount_due > 0),
     is_paid INTEGER NOT NULL DEFAULT 0 CHECK(is_paid IN (0,1)),
     session_date TEXT NOT NULL,
+    subject TEXT DEFAULT NULL,
     notes TEXT DEFAULT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE

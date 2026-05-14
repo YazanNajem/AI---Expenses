@@ -334,7 +334,7 @@ def tutoring():
     sessions = db.execute(
         "SELECT ts.*, s.name AS student_name "
         "FROM tutoring_sessions ts JOIN students s ON s.id=ts.student_id "
-        "ORDER BY ts.session_date DESC, ts.created_at DESC LIMIT 50"
+        "ORDER BY ts.session_date DESC, ts.created_at DESC"
     ).fetchall()
 
     reports = db.execute(
@@ -347,12 +347,17 @@ def tutoring():
         "GROUP BY s.id ORDER BY total_remaining DESC"
     ).fetchall()
 
+    total_unpaid = db.execute(
+        "SELECT COALESCE(SUM(amount_due),0) AS total FROM tutoring_sessions WHERE is_paid=0"
+    ).fetchone()['total']
+
     db.close()
 
     return render_template('tutoring.html',
                            students=students,
                            sessions=sessions,
                            reports=reports,
+                           total_unpaid=total_unpaid,
                            format_currency=fmt,
                            today=today_str())
 
@@ -389,15 +394,18 @@ def add_session():
     notes = (request.form.get('notes') or '').strip()[:MAX_STRING_LEN]
 
     amount_due = round(hourly_rate * (hours + minutes / 60), 2)
+    subject = (request.form.get('subject') or '').strip()[:200]
 
     db.execute(
-        "INSERT INTO tutoring_sessions (student_id,hourly_rate,hours,minutes,amount_due,is_paid,session_date,notes) "
-        "VALUES (?,?,?,?,?,?,?,?)",
-        (student_id, hourly_rate, hours, minutes, amount_due, is_paid, session_date, notes)
+        "INSERT INTO tutoring_sessions (student_id,hourly_rate,hours,minutes,amount_due,is_paid,session_date,subject,notes) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (student_id, hourly_rate, hours, minutes, amount_due, is_paid, session_date, subject or None, notes)
     )
     db.commit()
     db.close()
     if is_paid:
+        wallet_add_personal(amount_due)
+    else:
         wallet_add_students(amount_due)
     return redirect(url_for('tutoring'))
 
@@ -454,18 +462,24 @@ def edit_session(session_id):
     old_is_paid = old['is_paid'] if old else 0
     old_amount = old['amount_due'] if old else 0
 
+    subject = (request.form.get('subject') or '').strip()[:200]
+
     db.execute(
-        "UPDATE tutoring_sessions SET student_id=?,hourly_rate=?,hours=?,minutes=?,amount_due=?,is_paid=?,session_date=?,notes=? WHERE id=?",
-        (student_id, hourly_rate, hours, minutes, amount_due, is_paid, session_date, notes, session_id)
+        "UPDATE tutoring_sessions SET student_id=?,hourly_rate=?,hours=?,minutes=?,amount_due=?,is_paid=?,session_date=?,subject=?,notes=? WHERE id=?",
+        (student_id, hourly_rate, hours, minutes, amount_due, is_paid, session_date, subject or None, notes, session_id)
     )
     db.commit()
     db.close()
 
     if old_is_paid and not is_paid:
-        wallet_add_students(-old_amount)
-    elif not old_is_paid and is_paid:
+        wallet_add_personal(-old_amount)
         wallet_add_students(amount_due)
+    elif not old_is_paid and is_paid:
+        wallet_add_students(-old_amount)
+        wallet_add_personal(amount_due)
     elif old_is_paid and is_paid:
+        wallet_add_personal(amount_due - old_amount)
+    else:
         wallet_add_students(amount_due - old_amount)
 
     return redirect(url_for('tutoring'))
@@ -475,9 +489,15 @@ def edit_session(session_id):
 def delete_session(session_id):
     db = get_db()
     row = db.execute("SELECT is_paid, amount_due FROM tutoring_sessions WHERE id=?", (session_id,)).fetchone()
-    if row and row['is_paid']:
-        wallet_add_students(-row['amount_due'])
+    if row:
+        if row['is_paid']:
+            wallet_add_personal(-row['amount_due'])
+        else:
+            wallet_add_students(-row['amount_due'])
     db.execute("DELETE FROM tutoring_sessions WHERE id=?", (session_id,))
+    empty = db.execute("SELECT COUNT(*) AS cnt FROM tutoring_sessions").fetchone()['cnt']
+    if empty == 0:
+        db.execute("DELETE FROM sqlite_sequence WHERE name='tutoring_sessions'")
     db.commit()
     db.close()
     return redirect(url_for('tutoring'))
@@ -487,14 +507,124 @@ def delete_session(session_id):
 def api_delete_session(session_id):
     try:
         db = get_db()
-        row = db.execute("SELECT is_paid, amount_due FROM tutoring_sessions WHERE id=?", (session_id,)).fetchone()
-        if row and row['is_paid']:
-            wallet_add_students(-row['amount_due'])
+        row = db.execute("SELECT is_paid, amount_due, student_id FROM tutoring_sessions WHERE id=?", (session_id,)).fetchone()
+        student_id = row['student_id'] if row else None
+        if row:
+            if row['is_paid']:
+                wallet_add_personal(-row['amount_due'])
+            else:
+                wallet_add_students(-row['amount_due'])
         db.execute("DELETE FROM tutoring_sessions WHERE id=?", (session_id,))
+        empty = db.execute("SELECT COUNT(*) AS cnt FROM tutoring_sessions").fetchone()['cnt']
+        if empty == 0:
+            db.execute("DELETE FROM sqlite_sequence WHERE name='tutoring_sessions'")
         db.commit()
+
+        total_unpaid = db.execute(
+            "SELECT COALESCE(SUM(amount_due),0) AS total FROM tutoring_sessions WHERE is_paid=0"
+        ).fetchone()['total']
+
+        report = None
+        if student_id:
+            report = db.execute(
+                "SELECT s.id, s.name, "
+                "COALESCE(ROUND(SUM(ts.hours+ts.minutes/60.0),2),0) AS total_hours, "
+                "COALESCE(SUM(ts.amount_due),0) AS total_due, "
+                "COALESCE(SUM(CASE WHEN ts.is_paid=1 THEN ts.amount_due ELSE 0 END),0) AS total_paid, "
+                "COALESCE(SUM(CASE WHEN ts.is_paid=0 THEN ts.amount_due ELSE 0 END),0) AS total_remaining "
+                "FROM students s LEFT JOIN tutoring_sessions ts ON ts.student_id=s.id WHERE s.id=? GROUP BY s.id",
+                (student_id,)
+            ).fetchone()
+
         db.close()
         w = wallet_op()
         return jsonify({'success': True, 'wallet': {
+            'personal_balance': w['personal_balance'],
+            'students_balance': w['students_balance'],
+            'grand_total': w['personal_balance'] + w['students_balance']
+        }, 'total_unpaid': total_unpaid, 'report': {
+            'id': report['id'] if report else 0,
+            'total_hours': report['total_hours'] if report else 0,
+            'total_due': report['total_due'] if report else 0,
+            'total_paid': report['total_paid'] if report else 0,
+            'total_remaining': report['total_remaining'] if report else 0
+        } if report else None})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/tutoring/sessions/<int:session_id>/edit', methods=['POST'])
+def api_edit_session(session_id):
+    try:
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify({'error': 'No data'}), 400
+        student_id = int(data.get('student_id', 0))
+        if student_id <= 0:
+            return jsonify({'error': 'Invalid student'}), 400
+        hourly_rate = float(data.get('hourly_rate', 0))
+        if hourly_rate <= 0:
+            return jsonify({'error': 'Invalid rate'}), 400
+        hours = int(data.get('hours', 0))
+        minutes = int(data.get('minutes', 0))
+        if hours < 0 or minutes < 0 or minutes > 59:
+            return jsonify({'error': 'Invalid time'}), 400
+        session_date = (data.get('session_date') or '').strip()
+        is_paid = 1 if data.get('is_paid') else 0
+        notes = (data.get('notes') or '').strip()
+        subject = (data.get('subject') or '').strip()[:200]
+
+        amount_due = round(hourly_rate * (hours + minutes / 60), 2)
+
+        db = get_db()
+        student_name = (data.get('student_name') or '').strip()[:200]
+        if student_name:
+            db.execute("UPDATE students SET name=? WHERE id=?", (student_name, student_id))
+        old = db.execute("SELECT is_paid, amount_due FROM tutoring_sessions WHERE id=?", (session_id,)).fetchone()
+        if not old:
+            db.close()
+            return jsonify({'error': 'Not found'}), 404
+        old_is_paid = old['is_paid']
+        old_amount = old['amount_due']
+
+        db.execute(
+            "UPDATE tutoring_sessions SET student_id=?,hourly_rate=?,hours=?,minutes=?,amount_due=?,is_paid=?,session_date=?,subject=?,notes=? WHERE id=?",
+            (student_id, hourly_rate, hours, minutes, amount_due, is_paid, session_date, subject or None, notes, session_id)
+        )
+        db.commit()
+
+        if old_is_paid and not is_paid:
+            wallet_add_personal(-old_amount)
+            wallet_add_students(amount_due)
+        elif not old_is_paid and is_paid:
+            wallet_add_students(-old_amount)
+            wallet_add_personal(amount_due)
+        elif old_is_paid and is_paid:
+            wallet_add_personal(amount_due - old_amount)
+        else:
+            wallet_add_students(amount_due - old_amount)
+
+        row = db.execute(
+            "SELECT ts.*, s.name AS student_name "
+            "FROM tutoring_sessions ts JOIN students s ON s.id=ts.student_id WHERE ts.id=?",
+            (session_id,)
+        ).fetchone()
+        db.close()
+
+        w = wallet_op()
+        return jsonify({'success': True, 'session': {
+            'id': row['id'],
+            'student_id': row['student_id'],
+            'student_name': row['student_name'],
+            'subject': row['subject'],
+            'hourly_rate': row['hourly_rate'],
+            'hours': row['hours'],
+            'minutes': row['minutes'],
+            'amount_due': row['amount_due'],
+            'is_paid': row['is_paid'],
+            'session_date': row['session_date'],
+            'notes': row['notes'] or ''
+        }, 'wallet': {
             'personal_balance': w['personal_balance'],
             'students_balance': w['students_balance'],
             'grand_total': w['personal_balance'] + w['students_balance']
@@ -511,17 +641,33 @@ def api_delete_student(student_id):
             "SELECT COALESCE(SUM(amount_due),0) AS total FROM tutoring_sessions WHERE student_id=? AND is_paid=1",
             (student_id,)
         ).fetchone()['total']
+        unpaid = db.execute(
+            "SELECT COALESCE(SUM(amount_due),0) AS total FROM tutoring_sessions WHERE student_id=? AND is_paid=0",
+            (student_id,)
+        ).fetchone()['total']
+        db.execute("DELETE FROM tutoring_sessions WHERE student_id=?", (student_id,))
         db.execute("DELETE FROM students WHERE id=?", (student_id,))
+        empty_students = db.execute("SELECT COUNT(*) AS cnt FROM students").fetchone()['cnt']
+        if empty_students == 0:
+            db.execute("DELETE FROM sqlite_sequence WHERE name='students'")
+        empty_sessions = db.execute("SELECT COUNT(*) AS cnt FROM tutoring_sessions").fetchone()['cnt']
+        if empty_sessions == 0:
+            db.execute("DELETE FROM sqlite_sequence WHERE name='tutoring_sessions'")
+        total_unpaid = db.execute(
+            "SELECT COALESCE(SUM(amount_due),0) AS total FROM tutoring_sessions WHERE is_paid=0"
+        ).fetchone()['total']
         db.commit()
         db.close()
         if paid > 0:
-            wallet_add_students(-paid)
+            wallet_add_personal(-paid)
+        if unpaid > 0:
+            wallet_add_students(-unpaid)
         w = wallet_op()
         return jsonify({'success': True, 'wallet': {
             'personal_balance': w['personal_balance'],
             'students_balance': w['students_balance'],
             'grand_total': w['personal_balance'] + w['students_balance']
-        }})
+        }, 'total_unpaid': total_unpaid})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 

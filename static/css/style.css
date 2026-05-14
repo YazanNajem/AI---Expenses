@@ -99,6 +99,22 @@ body {
     font-size: 0.875rem;
 }
 
+/* Privacy Mode */
+.wallet-blur .wallet-value {
+    filter: blur(8px);
+    user-select: none;
+}
+
+.sessions-blur .sess-rate-due {
+    filter: blur(6px);
+    user-select: none;
+}
+
+.reports-blur .rep-amounts {
+    filter: blur(6px);
+    user-select: none;
+}
+
 @media (max-width: 576px) {
     #chat-popup {
         width: calc(100vw - 48px);

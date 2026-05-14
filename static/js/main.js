@@ -127,6 +127,30 @@ document.addEventListener('click', function (e) {
     .catch(function (err) { alert(err.message); });
 });
 
+function updateTotalUnpaid(val) {
+    var el = document.getElementById('total-unpaid');
+    if (el) el.textContent = fmtAED(val);
+}
+
+function updateReportRow(report) {
+    if (!report) return;
+    var tr = document.querySelector('#reports-tbody tr[data-id="' + report.id + '"]');
+    if (!tr) return;
+    if (report.total_due === 0 && report.total_paid === 0 && report.total_remaining === 0) {
+        tr.remove();
+        return;
+    }
+    var cells = tr.querySelectorAll('td');
+    if (cells.length >= 7) {
+        cells[2].textContent = report.total_hours + ' hrs';
+        cells[3].textContent = fmtAED(report.total_due);
+        cells[4].textContent = fmtAED(report.total_paid);
+        var remCell = cells[5];
+        remCell.textContent = fmtAED(report.total_remaining);
+        remCell.className = 'rep-amounts' + (report.total_remaining > 0 ? ' text-danger fw-bold' : '');
+    }
+}
+
 document.addEventListener('click', function (e) {
     var btn = e.target.closest('.delete-session-btn');
     if (!btn) return;
@@ -145,6 +169,9 @@ document.addEventListener('click', function (e) {
         if (data.error) { alert(data.error); return; }
         if (tr) tr.remove();
         if (data.wallet) updateWalletCards(data.wallet);
+        if (data.total_unpaid !== undefined) updateTotalUnpaid(data.total_unpaid);
+        if (data.report) updateReportRow(data.report);
+        initSessionsPagination();
     })
     .catch(function (err) { alert(err.message); });
 });
@@ -154,7 +181,8 @@ document.addEventListener('click', function (e) {
     if (!btn) return;
     if (!confirm('Delete student "' + btn.dataset.name + '" and all their sessions?')) return;
     var tr = btn.closest('tr');
-    fetch('/api/tutoring/students/' + btn.dataset.id + '/delete', {
+    var sid = btn.dataset.id;
+    fetch('/api/tutoring/students/' + sid + '/delete', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: '{}'
@@ -167,10 +195,14 @@ document.addEventListener('click', function (e) {
         if (data.error) { alert(data.error); return; }
         if (tr) tr.remove();
         if (data.wallet) updateWalletCards(data.wallet);
+        if (data.total_unpaid !== undefined) updateTotalUnpaid(data.total_unpaid);
+        // Remove student from select dropdown
+        var opt = document.querySelector('select[name="student_id"] option[value="' + sid + '"]');
+        if (opt) opt.remove();
         // Also remove all session rows for this student
-        var sid = btn.dataset.id;
-        var sessionRows = document.querySelectorAll('.table-hover tbody tr[data-student="' + sid + '"]');
+        var sessionRows = document.querySelectorAll('#sessions-tbody tr[data-student="' + sid + '"]');
         sessionRows.forEach(function (row) { row.remove(); });
+        initSessionsPagination();
     })
     .catch(function (err) { alert(err.message); });
 });
@@ -240,19 +272,87 @@ document.addEventListener('click', function (e) {
 });
 
 // ─── Edit Session Modal ───
+function calcEditAmountDue() {
+    var rate = parseFloat(document.getElementById('edit-session-rate').value) || 0;
+    var hrs = parseInt(document.getElementById('edit-session-hours').value) || 0;
+    var mins = parseInt(document.getElementById('edit-session-minutes').value) || 0;
+    var total = rate * (hrs + mins / 60);
+    document.getElementById('edit-session-amount-due').value = 'AED ' + total.toFixed(2);
+}
+
 document.addEventListener('click', function (e) {
     var btn = e.target.closest('.edit-session-btn');
     if (!btn) return;
     var tr = btn.closest('tr');
     document.getElementById('edit-session-id').value = tr.dataset.id;
     document.getElementById('edit-session-student').value = tr.dataset.student;
+    document.getElementById('edit-session-student-name').value = tr.dataset.studentName || tr.querySelector('td:nth-child(2)').textContent;
+    document.getElementById('edit-session-subject').value = tr.dataset.subject || '';
     document.getElementById('edit-session-rate').value = tr.dataset.rate;
     document.getElementById('edit-session-hours').value = tr.dataset.hours;
     document.getElementById('edit-session-minutes').value = tr.dataset.minutes;
     document.getElementById('edit-session-date').value = tr.dataset.date;
     document.getElementById('edit-session-notes').value = tr.dataset.notes;
     document.getElementById('edit-session-paid').checked = tr.dataset.paid === '1';
-    document.getElementById('edit-session-form').action = '/tutoring/edit-session/' + tr.dataset.id;
+    calcEditAmountDue();
+});
+
+document.getElementById('edit-session-rate')?.addEventListener('input', calcEditAmountDue);
+document.getElementById('edit-session-hours')?.addEventListener('input', calcEditAmountDue);
+document.getElementById('edit-session-minutes')?.addEventListener('input', calcEditAmountDue);
+
+document.getElementById('edit-session-form')?.addEventListener('submit', function (e) {
+    e.preventDefault();
+    var sid = document.getElementById('edit-session-id').value;
+    var data = {
+        student_id: document.getElementById('edit-session-student').value,
+        student_name: document.getElementById('edit-session-student-name').value.trim(),
+        subject: document.getElementById('edit-session-subject').value.trim(),
+        hourly_rate: document.getElementById('edit-session-rate').value,
+        hours: document.getElementById('edit-session-hours').value,
+        minutes: document.getElementById('edit-session-minutes').value,
+        session_date: document.getElementById('edit-session-date').value,
+        notes: document.getElementById('edit-session-notes').value,
+        is_paid: document.getElementById('edit-session-paid').checked ? 1 : 0
+    };
+    fetch('/api/tutoring/sessions/' + sid + '/edit', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data)
+    })
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+        if (data.error) { alert(data.error); return; }
+        var s = data.session;
+        var tr = document.querySelector('#sessions-tbody tr[data-id="' + s.id + '"]');
+        if (tr) {
+            tr.dataset.student = s.student_id;
+            tr.dataset.studentName = s.student_name;
+            tr.dataset.subject = s.subject;
+            tr.dataset.rate = s.hourly_rate;
+            tr.dataset.hours = s.hours;
+            tr.dataset.minutes = s.minutes;
+            tr.dataset.date = s.session_date;
+            tr.dataset.notes = s.notes;
+            tr.dataset.paid = s.is_paid;
+            tr.innerHTML =
+                '<td>' + tr.rowIndex + '</td>' +
+                '<td>' + escHtml(s.student_name) + '</td>' +
+                '<td>' + escHtml(s.subject || '---') + '</td>' +
+                '<td class="sess-rate-due">' + fmtAED(s.hourly_rate) + '/hr</td>' +
+                '<td>' + s.hours + 'h ' + s.minutes + 'm</td>' +
+                '<td class="sess-rate-due">' + fmtAED(s.amount_due) + '</td>' +
+                '<td>' + (s.is_paid ? '<span class="badge bg-success">Paid</span>' : '<span class="badge bg-warning text-dark">Unpaid</span>') + '</td>' +
+                '<td>' + s.session_date + '</td>' +
+                '<td class="text-end">' +
+                '<button class="btn btn-sm btn-outline-primary edit-session-btn" data-bs-toggle="modal" data-bs-target="#editSessionModal">Edit</button> ' +
+                '<button class="btn btn-sm btn-outline-danger delete-session-btn" data-id="' + s.id + '">Delete</button>' +
+                '</td>';
+        }
+        if (data.wallet) updateWalletCards(data.wallet);
+        bootstrap.Modal.getInstance(document.getElementById('editSessionModal')).hide();
+    })
+    .catch(function (err) { alert(err.message); });
 });
 
 // ─── Chatbot (Floating Widget) ───
@@ -356,16 +456,173 @@ function sendChatMessage() {
     }
 })();
 
-// ─── Add New Student ───
+// ─── Sessions Pagination ───
+var PER_PAGE = 5;
+
+function initSessionsPagination() {
+    var tbody = document.getElementById('sessions-tbody');
+    var nav = document.getElementById('sessions-pagination-nav');
+    var pag = document.getElementById('sessions-pagination');
+    if (!tbody || !nav || !pag) return;
+    var rows = Array.from(tbody.querySelectorAll('tr'));
+    var total = rows.length;
+    var pages = Math.max(1, Math.ceil(total / PER_PAGE));
+
+    if (total <= PER_PAGE) {
+        nav.classList.add('d-none');
+        rows.forEach(function (r) { r.style.display = ''; });
+        return;
+    }
+    nav.classList.remove('d-none');
+
+    function showPage(p) {
+        var start = (p - 1) * PER_PAGE;
+        var end = start + PER_PAGE;
+        rows.forEach(function (r, i) {
+            r.style.display = (i >= start && i < end) ? '' : 'none';
+        });
+        var btns = pag.querySelectorAll('.page-item');
+        btns.forEach(function (item, i) {
+            var a = item.querySelector('a');
+            if (!a) return;
+            var num = parseInt(a.dataset.page);
+            if (num === p) item.classList.add('active');
+            else item.classList.remove('active');
+        });
+    }
+
+    function buildPages(current) {
+        pag.innerHTML = '';
+        var prevLi = document.createElement('li');
+        prevLi.className = 'page-item' + (current <= 1 ? ' disabled' : '');
+        prevLi.innerHTML = '<a class="page-link" href="#" data-page="prev">&laquo; Previous</a>';
+        pag.appendChild(prevLi);
+
+        for (var i = 1; i <= pages; i++) {
+            var li = document.createElement('li');
+            li.className = 'page-item' + (i === current ? ' active' : '');
+            li.innerHTML = '<a class="page-link" href="#" data-page="' + i + '">' + i + '</a>';
+            pag.appendChild(li);
+        }
+
+        var nextLi = document.createElement('li');
+        nextLi.className = 'page-item' + (current >= pages ? ' disabled' : '');
+        nextLi.innerHTML = '<a class="page-link" href="#" data-page="next">Next &raquo;</a>';
+        pag.appendChild(nextLi);
+    }
+
+    buildPages(1);
+    showPage(1);
+
+    pag.addEventListener('click', function (e) {
+        var a = e.target.closest('a');
+        if (!a) return;
+        e.preventDefault();
+        var dp = a.dataset.page;
+        var cur = pag.querySelector('.page-item.active a');
+        var curPage = cur ? parseInt(cur.dataset.page) : 1;
+        var next;
+        if (dp === 'prev') next = Math.max(1, curPage - 1);
+        else if (dp === 'next') next = Math.min(pages, curPage + 1);
+        else next = parseInt(dp);
+        if (next === curPage) return;
+        buildPages(next);
+        showPage(next);
+    });
+}
+
+document.addEventListener('DOMContentLoaded', initSessionsPagination);
+
+// ─── Section Privacy Toggles ───
+function setupSectionToggle(btnClass, cardId, blurClass) {
+    var btn = document.querySelector('.' + btnClass);
+    var card = document.getElementById(cardId);
+    if (!btn || !card) return;
+    var icon = btn.querySelector('i');
+    btn.addEventListener('click', function () {
+        var active = card.classList.toggle(blurClass);
+        if (icon) icon.className = active ? 'bi bi-eye-slash' : 'bi bi-eye';
+    });
+}
+
+document.addEventListener('DOMContentLoaded', function () {
+    setupSectionToggle('session-privacy-toggle', 'sessions-card', 'sessions-blur');
+    setupSectionToggle('reports-privacy-toggle', 'reports-card', 'reports-blur');
+});
+
+// ─── Global Privacy Mode Toggle ───
+(function () {
+    var toggle = document.getElementById('privacy-toggle');
+    var icon = toggle ? toggle.querySelector('i') : null;
+    var row = document.getElementById('wallet-row');
+
+    function applyBlur(active) {
+        if (active) {
+            if (row) row.classList.add('wallet-blur');
+            var extra = document.getElementById('total-unpaid');
+            if (extra) extra.closest('.card')?.classList.add('wallet-blur');
+            if (icon) { icon.className = 'bi bi-eye-slash'; }
+        } else {
+            if (row) row.classList.remove('wallet-blur');
+            var extra = document.getElementById('total-unpaid');
+            if (extra) extra.closest('.card')?.classList.remove('wallet-blur');
+            if (icon) { icon.className = 'bi bi-eye'; }
+        }
+    }
+
+    var saved = localStorage.getItem('privacyMode');
+    if (saved === '1') applyBlur(true);
+
+    if (toggle) {
+        toggle.addEventListener('click', function () {
+            var active = localStorage.getItem('privacyMode') === '1';
+            var next = active ? '0' : '1';
+            localStorage.setItem('privacyMode', next);
+            applyBlur(next === '1');
+        });
+    }
+})();
+
+// ─── Quick Add Student (inline) ───
+document.getElementById('btn-quick-add-student')?.addEventListener('click', addQuickStudent);
+document.getElementById('quick-student-name')?.addEventListener('keypress', function (e) {
+    if (e.key === 'Enter') addQuickStudent();
+});
+
+function addQuickStudent() {
+    var input = document.getElementById('quick-student-name');
+    var name = input.value.trim();
+    if (!name) { alert('Student name is required'); input.focus(); return; }
+    fetch('/tutoring/add-student', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ name: name })
+    })
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+        if (data.error) { alert(data.error); return; }
+        var select = document.querySelector('select[name="student_id"]');
+        var opt = document.createElement('option');
+        opt.value = data.id;
+        opt.textContent = data.name;
+        select.insertBefore(opt, select.querySelector('option[value="__new__"]'));
+        select.value = data.id;
+        input.value = '';
+        input.focus();
+    });
+}
+
+// ─── Add New Student (modal) ───
 function addNewStudent() {
-    var name = document.getElementById('new-student-name').value.trim();
-    if (!name) { alert('Student name is required'); return; }
+    var studentName = document.getElementById('new-student-name').value.trim();
+    if (!studentName) { alert('Student name is required'); return; }
+    var subjectName = document.getElementById('new-student-subject').value.trim();
     fetch('/tutoring/add-student', {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: new URLSearchParams({
-            name: name,
-            subject: document.getElementById('new-student-subject').value,
+            name: studentName,
+            subject: subjectName,
             notes: document.getElementById('new-student-notes').value
         })
     })
@@ -374,7 +631,7 @@ function addNewStudent() {
         var select = document.querySelector('select[name="student_id"]');
         var opt = document.createElement('option');
         opt.value = data.id;
-        opt.textContent = data.name + (data.subject ? ' (' + data.subject + ')' : '');
+        opt.textContent = data.name;
         select.insertBefore(opt, select.querySelector('option[value="__new__"]'));
         select.value = data.id;
         bootstrap.Modal.getInstance(document.getElementById('addStudentModal')).hide();

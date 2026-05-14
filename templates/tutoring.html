@@ -11,12 +11,15 @@
             <div class="row g-3">
                 <div class="col-md-4">
                     <label class="form-label">Student</label>
+                    <div class="input-group mb-2">
+                        <input type="text" id="quick-student-name" class="form-control" placeholder="Enter student name...">
+                        <button type="button" class="btn btn-primary" id="btn-quick-add-student">Add</button>
+                    </div>
                     <select name="student_id" class="form-select" required>
-                        <option value="">-- Select Student --</option>
+                        <option value="">Select Student</option>
                         {% for s in students %}
-                        <option value="{{ s.id }}">{{ s.name }}{% if s.subject %} ({{ s.subject }}){% endif %}</option>
+                        <option value="{{ s.id }}">{{ s.name }}</option>
                         {% endfor %}
-                        <option value="__new__">+ Add New Student...</option>
                     </select>
                 </div>
                 <div class="col-md-4">
@@ -62,7 +65,19 @@
 </div>
 
 <div class="card mb-4">
-    <div class="card-header"><strong>Recent Sessions</strong></div>
+    <div class="card-body text-center py-3">
+        <h6 class="card-subtitle text-muted">Total Unpaid</h6>
+        <h2 class="card-title text-danger mt-1 mb-0 wallet-value" id="total-unpaid">{{ format_currency(total_unpaid) }}</h2>
+    </div>
+</div>
+
+<div class="card mb-4" id="sessions-card">
+    <div class="card-header d-flex align-items-center justify-content-between">
+        <strong>Recent Sessions</strong>
+        <button class="btn btn-sm btn-outline-secondary session-privacy-toggle" title="Toggle session amounts visibility">
+            <i class="bi bi-eye"></i>
+        </button>
+    </div>
     <div class="card-body p-0">
         {% if sessions %}
         <div class="table-responsive">
@@ -71,6 +86,7 @@
                     <tr>
                         <th>#</th>
                         <th>Student</th>
+                        <th>Subject</th>
                         <th>Rate</th>
                         <th>Time</th>
                         <th>Due</th>
@@ -79,16 +95,18 @@
                         <th class="text-end">Actions</th>
                     </tr>
                 </thead>
-                <tbody>
+                <tbody id="sessions-tbody">
                     {% for s in sessions %}
-                    <tr data-id="{{ s.id }}" data-student="{{ s.student_id }}" data-rate="{{ s.hourly_rate }}"
+                    <tr data-id="{{ s.id }}" data-student="{{ s.student_id }}" data-student-name="{{ s.student_name }}"
+                        data-rate="{{ s.hourly_rate }}" data-subject="{{ s.subject or '' }}"
                         data-hours="{{ s.hours }}" data-minutes="{{ s.minutes }}"
                         data-date="{{ s.session_date }}" data-paid="{{ s.is_paid }}" data-notes="{{ s.notes or '' }}">
-                        <td>{{ s.id }}</td>
+                        <td>{{ loop.index }}</td>
                         <td>{{ s.student_name }}</td>
-                        <td>{{ format_currency(s.hourly_rate) }}/hr</td>
+                        <td>{{ s.subject or '---' }}</td>
+                        <td class="sess-rate-due">{{ format_currency(s.hourly_rate) }}/hr</td>
                         <td>{{ s.hours }}h {{ s.minutes }}m</td>
-                        <td>{{ format_currency(s.amount_due) }}</td>
+                        <td class="sess-rate-due">{{ format_currency(s.amount_due) }}</td>
                         <td>{% if s.is_paid %}<span class="badge bg-success">Paid</span>{% else %}<span class="badge bg-warning text-dark">Unpaid</span>{% endif %}</td>
                         <td>{{ s.session_date }}</td>
                         <td class="text-end">
@@ -100,14 +118,22 @@
                 </tbody>
             </table>
         </div>
+        <nav id="sessions-pagination-nav" class="d-none">
+            <ul class="pagination pagination-sm justify-content-center my-3" id="sessions-pagination"></ul>
+        </nav>
         {% else %}
         <div class="card-body"><p class="text-muted mb-0">No sessions recorded yet.</p></div>
         {% endif %}
     </div>
 </div>
 
-<div class="card mb-4">
-    <div class="card-header"><strong>Student Reports</strong></div>
+<div class="card mb-4" id="reports-card">
+    <div class="card-header d-flex align-items-center justify-content-between">
+        <strong>Student Reports</strong>
+        <button class="btn btn-sm btn-outline-secondary reports-privacy-toggle" title="Toggle report amounts visibility">
+            <i class="bi bi-eye"></i>
+        </button>
+    </div>
     <div class="card-body p-0">
         {% if reports %}
         <div class="table-responsive">
@@ -116,7 +142,6 @@
                     <tr>
                         <th>#</th>
                         <th>Student</th>
-                        <th>Subject</th>
                         <th>Total Time</th>
                         <th>Total Due</th>
                         <th>Paid</th>
@@ -124,16 +149,15 @@
                         <th class="text-end">Actions</th>
                     </tr>
                 </thead>
-                <tbody>
+                <tbody id="reports-tbody">
                     {% for r in reports %}
-                    <tr>
+                    <tr data-id="{{ r.id }}">
                         <td>{{ r.id }}</td>
                         <td><strong>{{ r.name }}</strong></td>
-                        <td>{{ r.subject or '---' }}</td>
                         <td>{{ r.total_hours }} hrs</td>
-                        <td>{{ format_currency(r.total_due) }}</td>
-                        <td class="text-success fw-bold">{{ format_currency(r.total_paid) }}</td>
-                        <td class="{% if r.total_remaining > 0 %}text-danger fw-bold{% endif %}">
+                        <td class="rep-amounts">{{ format_currency(r.total_due) }}</td>
+                        <td class="rep-amounts text-success fw-bold">{{ format_currency(r.total_paid) }}</td>
+                        <td class="rep-amounts {% if r.total_remaining > 0 %}text-danger fw-bold{% endif %}">
                             {{ format_currency(r.total_remaining) }}
                         </td>
                         <td class="text-end">
@@ -161,11 +185,21 @@
             <form method="POST" id="edit-session-form">
                 <div class="modal-body">
                     <input type="hidden" name="session_id" id="edit-session-id">
+                    <div class="row mb-3">
+                        <div class="col-6">
+                            <label class="form-label">Student Name</label>
+                            <input type="text" id="edit-session-student-name" class="form-control" maxlength="200">
+                        </div>
+                        <div class="col-6">
+                            <label class="form-label">Subject</label>
+                            <input type="text" id="edit-session-subject" class="form-control" maxlength="200" placeholder="e.g. Mathematics">
+                        </div>
+                    </div>
                     <div class="mb-3">
-                        <label class="form-label">Student</label>
+                        <label class="form-label">Assign to Existing Student</label>
                         <select name="student_id" id="edit-session-student" class="form-select">
                             {% for s in students %}
-                            <option value="{{ s.id }}">{{ s.name }}{% if s.subject %} ({{ s.subject }}){% endif %}</option>
+                            <option value="{{ s.id }}">{{ s.name }}</option>
                             {% endfor %}
                         </select>
                     </div>
@@ -184,6 +218,10 @@
                         </div>
                     </div>
                     <div class="mb-3">
+                        <label class="form-label">Amount Due</label>
+                        <input type="text" id="edit-session-amount-due" class="form-control" value="AED 0.00" readonly style="font-weight:bold;background:#e9ecef;">
+                    </div>
+                    <div class="mb-3">
                         <label class="form-label">Date</label>
                         <input type="date" name="session_date" id="edit-session-date" class="form-control">
                     </div>
@@ -198,7 +236,7 @@
                 </div>
                 <div class="modal-footer">
                     <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
-                    <button type="submit" class="btn btn-primary">Save Changes</button>
+                    <button type="submit" class="btn btn-primary" id="btn-save-session-edit">Save Changes</button>
                 </div>
             </form>
         </div>

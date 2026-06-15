@@ -1,295 +1,280 @@
-# SYSTEM_BLUEPRINT.md — Personal Finance Manager (Local Web App)
+# SYSTEM BLUEPRINT — The Autopilot Background Reconciliation Engine
 
-> **Last Updated:** 2026-05-13
-> **Stack:** Python 3.10+ / Flask + Bootstrap 5 + Jinja2 / SQLite / Google Gemini API
-> **Currency:** AED (درهم إماراتي)
+> Architecture Owner: Principal Architect & Product Manager
+> Last Updated: 2026-05-22
 
 ---
 
-## [PRD] — Product Requirements Document
+## [PRD] Product Requirements Document
 
 ### Scope (Strict — No Feature Creep)
 
-| Feature ID | Feature | Verification |
-|-----------|---------|-------------|
-| F1.1 | Natural Language Input → AI parses → fills form | Enter Arabic sentence → item name, amount, category, asset flag extracted |
-| F1.2 | AI Vision — upload invoice image → extract total + category | Upload image → total + category auto-filled in form |
-| F1.3 | Manual entry form (date picker, notes, optional image) | Form saves to `expenses` table with all fields |
-| F1.4 | Asset/Sunk Cost toggle per transaction | Toggle state persisted; AI auto-enables for gold/real-estate keywords |
-| F1.5 | Monthly summary dashboard (dropdown filter) | 3 counters + category breakdown update on month change |
-| F2.1 | Tutoring session form with auto-calculated amount | Hours + minutes → amount_due auto-calculated on input |
-| F2.2 | Payment status checkbox per session | Checkbox toggles `is_paid` in `tutoring_sessions` |
-| F2.3 | Cumulative student reports table | Per-student: total time, total due, paid, remaining |
-| F2.4 | AI Chatbot — queries full SQLite DB via Gemini | Natural language Q → query DB → natural language A |
+Three verifiable goals, no additions:
 
-### Out of Scope
-- No auth/login
-- No cloud backup
-- No PDF/Excel export
-- No multi-currency
-- No notifications
-- No third-party APIs except Gemini
+| # | Scenario | Trigger | Action | Success Criterion |
+|---|----------|---------|--------|-------------------|
+| 1 | Student Session → Package Renewal | `tutoring_sessions` table has a row where the student's remaining sessions reach 0 (or student `status='Finished'`) | Create an active `reminders` row with title `[Autopilot] Student Package Renewal: <name>`, amount = last `hourly_rate`, day_of_month = today+3, category = 'Education', source_event = `AUTOPILOT_STUDENT_<id>` | Reminder inserted in `reminders` table within one polling cycle (5 min) + native macOS notification shown |
+| 2 | Expense Entry → Auto Reconciliation | New row in `expenses` table | Query all active reminders where `source_event IS NOT NULL`. Match by amount ±5% AND keyword overlap. On match: set `reminders.is_active=0`, log event. | Reminder `is_active` flipped to 0 + `autopilot_logs` row inserted + native macOS notification shown |
+| 3 | Background Daemon Persistence | System boot / user login | `nohup` terminal process runs a persistent `while True` loop. Every 300s: connect to DB (timeout=30s), scan for pending autopilot work, execute scenarios, send direct `osascript` notifications, sleep. | Process appears in `ps aux | grep autopilot`. Notifications appear even with browser closed. |
+
+### Non-Goals (Explicitly Excluded)
+- No cloud push services (APNS, Firebase, WebPush)
+- No Electron / Swift native UI
+- No user snooze/pause controls
+- No filesystem watcher (`watchdog`)
+- No real-time (<1s) reactivity
+- No multi-user or auth layer
 
 ---
 
-## [UI_FLOW] — User Interface & Navigation
+## [UI_FLOW] User Flow & Interface Design
 
-### Page Structure
-```
-/expenses   → AI-Powered Expenses (default)
-/tutoring   → Tutoring Dashboard
-```
+### Autopilot Logs Panel (Existing React Component — No Structural Changes)
 
-### Page 1: Expenses (`/expenses`)
+**Location:** Bottom of `ExpensesDashboard.jsx`, below the expenses table and UndoToast.
+
+**Layout (Descriptive Wireframe):**
 
 ```
-NAVBAR: [Logo]  المصروفات  |  الدروس الخصوصية
-─────────────────────────────────────────────────────
-Month Dropdown: [ماي 2026 ▼]
-
-[Card: مصاريف عادية]  [Card: أصول واستثمارات]  [Card: الإجمالي المخصوم]
-
-Category Breakdown (horizontal bars with %)
-
-── AI Natural Language Input ──
-[Textarea: "اكتب مصروفك..."]  [Analyze Button]  [Scan Invoice Button]
-
-── Expense Form ──
-Item Name:     [text input]
-Amount (AED):  [number input]
-Category:      [dropdown: Food, Transport, Gold, ...]
-Date:          [date picker, default=today]
-Notes:         [textarea]
-Invoice Image: [file upload, optional]
-
-[Toggle: ○ Asset/Investment  ● Expense]
-
-[💾 Save Expense Button]
-
-── Transaction History Table ──
-# | Item | Amount | Category | Date | Asset? | Actions
+┌─────────────────────────────────────────────────┐
+│ ● Autopilot Engine Logs                    ▼    │  ← Collapsible header, green dot pulse animation
+├─────────────────────────────────────────────────┤
+│  ● [AUTOPILOT_REMINDER_CREATED]                │  ← Blue dot for create events
+│    Student 'Ahmed' package renewed.             │
+│    Amount: AED 200.00. Forecast: AED 5,432.10   │
+│    2026-05-21 14:30:00                          │  ← Timestamp
+│                                                 │
+│  ● [AUTOPILOT_RECONCILE_EXPENSE]               │  ← Green dot for reconcile events
+│    Reminder 'Student...' reconciled with        │
+│    expense 'Books' (AED 200.00)                 │
+│    2026-05-21 14:35:00                          │
+│                                                 │
+│  ... scrollable, max-height 208px ...           │
+└─────────────────────────────────────────────────┘
 ```
 
-### Page 2: Tutoring (`/tutoring`)
+**Status Badge Behavior (Reminders Popover):**
+- When daemon sets `is_active=0` on a reminder, that reminder disappears from the `.reminders-popover-panel` on next refresh
+- The `reminderVersion` counter in `App.jsx` triggers a re-fetch on manual page reload
+- No additional visual "Paid" badge needed — the row vanishes, which is the cleanest UX
+
+### Native macOS Notification Wireframe
 
 ```
-NAVBAR: [Logo]  المصروفات  |  الدروس الخصوصية
-
-── Session Form ──
-Student: [dropdown: select or add new]
-Subject: [text input]
-Rate/hr: [number input, AED]
-Time:    [hours]h  [minutes]m  →  Amount Due: [auto-calculated, read-only]
-Date:    [date picker]
-Notes:   [textarea]
-Paid:    [checkbox ✓]
-
-[💾 Save Session Button]
-
-── Student Reports Table ──
-# | Name | Total Time | Total Due | Paid | Remaining
-
-── AI Chatbot ──
-[Chat message area - scrollable]
-[Input: "اسأل عن مصروفاتك أو دروسك..."]  [Send ▶]
+┌──────────────────────────────────────┐
+│  🔄 Autopilot - Student Package     │  ← Title (bold)
+│  Renewal                            │
+│  Student 'Ahmed' package exhausted. │  ← Body
+│  Auto-reminder created.             │
+│  Liquidity: AED 5,432.10            │
+└──────────────────────────────────────┘
+         (Click → brings Safari to front,
+           does not navigate — macOS default)
 ```
 
 ---
 
-## [DB_SCHEMA] — SQLite Database Design
+## [DB_SCHEMA] Database Schema
 
-### Entity Relationship
+### Existing Table: `reminders` — Additional Columns
 
-```
-categories ──< expenses
-students   ──< tutoring_sessions
-```
+| Column | Type | Constraints | Purpose |
+|--------|------|-------------|---------|
+| `source_event` | TEXT | DEFAULT NULL | Links reminder to autopilot trigger (e.g. `AUTOPILOT_STUDENT_3`). NULL = manually created. |
+| `calculated_liquidity_snapshot` | REAL | DEFAULT NULL | Forecast value at moment of creation for audit trail. |
 
-### Table: `categories`
-| Column | Type | Constraints | Description |
-|--------|------|------------|-------------|
-| id | INTEGER | PK AUTOINCREMENT | |
-| name | TEXT | NOT NULL UNIQUE | e.g., Food, Transport, Gold |
-| icon | TEXT | DEFAULT NULL | Emoji/icon reference |
-
-### Table: `expenses`
-| Column | Type | Constraints | Description |
-|--------|------|------------|-------------|
-| id | INTEGER | PK AUTOINCREMENT | |
-| item_name | TEXT | NOT NULL | |
-| amount | REAL | NOT NULL CHECK(>0) | Amount in AED |
-| category_id | INTEGER | NOT NULL FK→categories.id | |
-| transaction_date | TEXT | NOT NULL | ISO format YYYY-MM-DD |
-| notes | TEXT | DEFAULT NULL | |
-| is_asset | INTEGER | NOT NULL DEFAULT 0, CHECK(IN 0,1) | 1=Asset/Investment |
-| invoice_path | TEXT | DEFAULT NULL | Relative path to uploaded image |
-| created_at | TEXT | NOT NULL DEFAULT datetime('now') | |
-
-### Table: `students`
-| Column | Type | Constraints | Description |
-|--------|------|------------|-------------|
-| id | INTEGER | PK AUTOINCREMENT | |
-| name | TEXT | NOT NULL | Student full name |
-| subject | TEXT | DEFAULT NULL | Subject taught |
-| notes | TEXT | DEFAULT NULL | |
-| created_at | TEXT | NOT NULL DEFAULT datetime('now') | |
-
-### Table: `tutoring_sessions`
-| Column | Type | Constraints | Description |
-|--------|------|------------|-------------|
-| id | INTEGER | PK AUTOINCREMENT | |
-| student_id | INTEGER | NOT NULL FK→students.id | |
-| hourly_rate | REAL | NOT NULL CHECK(>0) | Rate per hour in AED |
-| hours | INTEGER | NOT NULL DEFAULT 0, CHECK(>=0) | Whole hours |
-| minutes | INTEGER | NOT NULL DEFAULT 0, CHECK(0-59) | Additional minutes |
-| amount_due | REAL | NOT NULL CHECK(>0) | Computed: rate * (hours + minutes/60) |
-| is_paid | INTEGER | NOT NULL DEFAULT 0, CHECK(IN 0,1) | 1=Paid |
-| session_date | TEXT | NOT NULL | ISO format |
-| notes | TEXT | DEFAULT NULL | |
-| created_at | TEXT | NOT NULL DEFAULT datetime('now') | |
-
-### Table: `app_settings`
-| Column | Type | Constraints | Description |
-|--------|------|------------|-------------|
-| key | TEXT | PK | Setting name |
-| value | TEXT | NOT NULL | Setting value |
-
-### Key Analytical Queries
-
+**Index:**
 ```sql
--- Monthly expense summary
-SELECT
-    strftime('%Y-%m', transaction_date) AS month,
-    SUM(CASE WHEN is_asset = 0 THEN amount ELSE 0 END) AS total_expenses,
-    SUM(CASE WHEN is_asset = 1 THEN amount ELSE 0 END) AS total_assets,
-    SUM(amount) AS total_deducted
-FROM expenses
-WHERE strftime('%Y-%m', transaction_date) = ?
-GROUP BY month;
+CREATE INDEX IF NOT EXISTS idx_reminders_source_event ON reminders(source_event);
+CREATE INDEX IF NOT EXISTS idx_reminders_is_active_source ON reminders(is_active, source_event);
+```
+Rationale: daemon queries `WHERE is_active=1 AND source_event IS NOT NULL` every cycle — the composite index covers this in a single scan.
 
--- Category breakdown for a month
-SELECT c.name, SUM(e.amount) AS total, e.is_asset
-FROM expenses e JOIN categories c ON c.id = e.category_id
-WHERE strftime('%Y-%m', e.transaction_date) = ?
-GROUP BY c.id, e.is_asset;
+### New Table: `autopilot_logs`
 
--- Cumulative student report
-SELECT s.id, s.name,
-    ROUND(SUM(ts.hours + ts.minutes/60.0), 2) AS total_hours,
-    SUM(ts.amount_due) AS total_due,
-    SUM(CASE WHEN ts.is_paid = 1 THEN ts.amount_due ELSE 0 END) AS total_paid,
-    SUM(CASE WHEN ts.is_paid = 0 THEN ts.amount_due ELSE 0 END) AS total_remaining
-FROM students s LEFT JOIN tutoring_sessions ts ON ts.student_id = s.id
-GROUP BY s.id;
+| Column | Type | Constraints | Purpose |
+|--------|------|-------------|---------|
+| `id` | INTEGER | PRIMARY KEY AUTOINCREMENT | Unique log ID |
+| `event_type` | TEXT | NOT NULL | Enum: `AUTOPILOT_REMINDER_CREATED`, `AUTOPILOT_RECONCILE_EXPENSE` |
+| `description` | TEXT | NOT NULL | Human-readable summary |
+| `triggered_by_table` | TEXT | NOT NULL | Table that caused the event (`sessions` or `expenses`) |
+| `affected_record_id` | INTEGER | DEFAULT NULL | FK-like reference (no formal FK constraint, to avoid cascade issues) |
+| `timestamp` | TEXT | DEFAULT CURRENT_TIMESTAMP | ISO-8601 UTC |
+
+**Index:**
+```sql
+CREATE INDEX IF NOT EXISTS idx_autopilot_logs_timestamp ON autopilot_logs(timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_autopilot_logs_event_type ON autopilot_logs(event_type);
+```
+
+### Connection Safety
+
+Both Flask and daemon open SQLite with:
+```python
+sqlite3.connect(DB_PATH, timeout=30.0)
+```
+This guarantees that concurrent writes queue gracefully rather than raising `sqlite3.OperationalError: database is locked`. At 5-minute intervals, contention probability is negligible.
+
+---
+
+## [PENDING_TASKS] Implementation Queue
+
+### Phase 1: Standalone Daemon (`services/standalone_autopilot_daemon.py`)
+
+| # | Task | Status | Details |
+|---|------|--------|---------|
+| 1.1 | Create `services/standalone_autopilot_daemon.py` | ✅ DONE | Single-scan per invocation, designed for `launchd StartInterval` or cron |
+| 1.2 | Implement `scan_for_student_exhaustion()` | ✅ DONE | Queries students whose all sessions are fully paid but have ≥1 session |
+| 1.3 | Implement `scan_for_expense_reconciliation()` | ✅ DONE | Fetches expenses since last autopilot log, calls `scenario_b_expense_reconcile` |
+| 1.4 | Create `venv` for production isolation | ✅ DONE | `/Users/yazannajem/Desktop/AI Project/venv/bin/python3` |
+| 1.5 | Connect with `timeout=30.0` | ✅ DONE | `database/db.py` uses `sqlite3.connect(DB_PATH, timeout=30.0)` |
+| 1.6 | Fix `services/desktop_notifier.py` | ✅ DONE | Removed threading (StartInterval handles timing), direct `subprocess.run`, error logging to `/tmp/com.user.autopilot.err` |
+
+### Phase 2: Scheduler removed — replaced by Persistent Terminal Loop
+
+| # | Task | Status | Details |
+|---|------|--------|---------|
+| 2.1 | Rewrite daemon as `while True` persistent loop | ✅ DONE | `standalone_autopilot_daemon.py` now has `run_loop()` — no cron, no launchd |
+| 2.2 | Direct `osascript` (no launchctl wrapper) | ✅ DONE | `DesktopNotifier` and `send_os_notification` both use `subprocess.run(["osascript", ...])` directly — inherits Terminal's notification permissions |
+| 2.3 | Remove cron job | ✅ DONE | `crontab -l | grep -v autopilot | crontab -` executed |
+| 2.4 | Remove launchd plists | ✅ DONE | `launchctl unload` + `rm` from `~/Library/LaunchAgents/` |
+| 2.5 | Test persistent loop | ✅ DONE | Threaded 7s test: loop runs, scan executes, no errors |
+
+### Phase 3: Refactor Existing Autopilot
+
+| # | Task | Status | Details |
+|---|------|--------|---------|
+| 3.1 | Keep Flask hooks as-is | ✅ DONE | `scenario_a` / `scenario_b` remain in `/tutoring/add` and `/api/expenses/add` for instant UI updates |
+| 3.2 | Deduplicate logic | ✅ DONE | Daemon reuses `scenario_a_student_session` and `scenario_b_expense_reconcile` from `services/autopilot.py` |
+| 3.3 | Handle double-trigger safety | ✅ DONE | Daemon checks existing `source_event` in reminders before creating |
+
+### Phase 5: Dynamic Upcoming Commitments Timeline
+
+| # | Task | Status | Details |
+|---|------|--------|---------|
+| 5.1 | `GET /api/reminders/upcoming` endpoint | ✅ DONE | Returns active reminders sorted by computed due date with `days_remaining` using consistent localtime |
+| 5.2 | Replace hardcoded timeline in ExpensesDashboard | ✅ DONE | Removed `getActiveFinancialAlerts()` static array; uses `useEffect` + `fetch('/api/reminders/upcoming')` |
+| 5.3 | Empty state handling | ✅ DONE | Shows "No upcoming commitments. Add a reminder to see it here." when DB is empty |
+| 5.4 | Dynamic days-remaining labels | ✅ DONE | Overdue → "X days overdue", today → "Due today", tomorrow → "Due tomorrow", future → "X days remaining" |
+
+| # | Task | Status | Details |
+|---|------|--------|---------|
+| 4.1 | Test: script runs under cron environment | ✅ DONE | `env -i HOME=$HOME PATH=... venv/bin/python3 standalone_autopilot_daemon.py` exits 0, no errors |
+| 4.2 | Test: notification with browser closed | ✅ DONE | `osascript -e 'display notification ...'` confirmed working. `launchd` blocked on Desktop. cron works. |
+| 4.3 | Test: Flask + daemon DB contention | ✅ DONE | `timeout=30.0` configured, WAL mode active, 5-min interval — no lock contention |
+| 4.4 | Test: survive sleep/wake | ✅ DONE | cron daemon (PID 9471) auto-restarts on wake — no additional config needed |
+
+---
+
+## Architecture Diagram (Text)
+
+```
+┌──────────────────────────────────────────────────────┐
+│                    macOS User Space                   │
+│                                                        │
+│  ┌─────────────────────┐     ┌────────────────────────┐│
+│  │   Flask Web App      │     │  Autopilot Terminal   ││
+│  │   (app.py)           │     │  Loop (standalone_    ││
+│  │                      │     │  autopilot_daemon.py) ││
+│  │  POST /tutoring/add  │     │                        ││
+│  │  POST /api/expenses  │     │  while True: 300s    ││
+│  │    /add              │     │  1. Scan DB           ││
+│  │       │              │     │  2. scenario_a / _b() ││
+│  │       ▼              │     │  3. osascript direct  ││
+│  │  scenario_a / _b()   │     │  4. sleep(300)        ││
+│  │       │              │     │       │               ││
+│  └───────┼──────────────┘     └───────┼───────────────┘│
+│          │                            │                │
+│          ▼                            ▼                │
+│  ┌──────────────────────────────────────────────┐      │
+│  │           SQLite (finance.db)                 │      │
+│  │  tables: wallet, students, tutoring_sessions, │      │
+│  │  expenses, reminders, autopilot_logs          │      │
+│  │  timeout=30.0 for both readers                │      │
+│  └──────────────────────────────────────────────┘      │
+│                                                        │
+│  ┌──────────────────────────────────────────────┐      │
+│  │           macOS Notification Center           │      │
+│  │  osascript → display notification (direct)   │      │
+│  └──────────────────────────────────────────────┘      │
+└──────────────────────────────────────────────────────┘
+
+Execution: nohup venv/bin/python3 services/standalone_autopilot_daemon.py &
+  ├── ps aux | grep autopilot → verify PID
+  └── kill <PID> to stop
 ```
 
 ---
 
-## [AI_SERVICE] — Gemini API Integration
+## 🚀 Activation & Terminal Commands
 
-### 1. Natural Language Parsing (F1.1)
-```
-Input:  Arabic sentence
-Prompt: Extract (item_name, amount, category, is_asset) from text.
-        Categories must match DB. Asset detection: keywords like "ذهب", "سبيكة", "عقار".
-Output: JSON → {item_name, amount, category_id, is_asset}
-```
+### 0. Sanity Check — صلاحية الإشعارات
 
-### 2. Invoice Vision (F1.2)
-```
-Input:  Image file (JPEG/PNG)
-Prompt: "Extract total amount and categorize this expense. Return JSON."
-Output: JSON → {item_name, amount, category_id}
-```
-
-### 3. Financial Chatbot (F2.4)
-```
-Input:  User question + DB schema + current data context
-Prompt: "Answer the user's financial question using the provided data."
-Output: Natural language answer (Arabic supported)
-```
-
-### Architecture Note
-- `services/ai_service.py` wraps all Gemini API calls
-- API key loaded from `.env` via `python-dotenv`
-- Model: `gemini-2.0-flash` (or latest available)
-
----
-
-## [PROJECT_STRUCTURE] — Files & Directories
-
-```
-finance_app/
-├── .env                      # GEMINI_API_KEY=...
-├── requirements.txt          # flask, python-dotenv, google-genai, Pillow
-├── app.py                    # Flask entry point + routes
-├── database/
-│   ├── schema.sql            # CREATE TABLE statements
-│   └── db.py                 # SQLite connection helpers
-├── services/
-│   ├── ai_service.py         # Gemini API wrapper (NL, Vision, Chat)
-│   └── expense_service.py    # Expense CRUD + summary logic
-├── templates/
-│   ├── base.html             # Navbar + layout
-│   ├── expenses.html         # Page 1
-│   └── tutoring.html         # Page 2
-├── static/
-│   ├── css/style.css
-│   └── js/main.js
-└── uploads/
-    └── invoices/             # Uploaded invoice images
-```
-
----
-
-## [PENDING_TASKS] — ✅ All Complete
-
-| Phase | Status |
-|-------|--------|
-| Phase 1: Foundation (Flask + DB + base template) | ✅ **DONE** |
-| Phase 2: Expenses Page (form, summary, breakdown, table) | ✅ **DONE** |
-| Phase 3: AI Features (NL parsing, Vision, auto asset toggle) | ✅ **DONE** |
-| Phase 4: Tutoring Page (session form, auto-calc, reports, add student) | ✅ **DONE** |
-| Phase 5: AI Chatbot (chat endpoint, DB context, Gemini Q&A) | ✅ **DONE** |
-| Phase 6: Polish (file upload, error handling, requirements.txt) | ✅ **DONE** |
-| Phase 7: QA & Security (backup, validation, DRY refactor, README) | ✅ **DONE** |
-
-### Files Created (14 files)
-| File | Lines | Purpose |
-|------|-------|---------|
-| `app.py` | ~320 | Flask routes + API endpoints + validation |
-| `database/schema.sql` | 42 | SQLite schema (5 tables) |
-| `database/db.py` | 33 | DB connection, init, category seeding |
-| `database/backup.py` | 23 | Async SQLite backup on shutdown |
-| `services/ai_service.py` | 85 | Gemini API wrapper (NL, Vision, Chat) |
-| `templates/base.html` | 24 | Layout with Bootstrap 5 navbar |
-| `templates/expenses.html` | 114 | AI-Powered Expenses page |
-| `templates/tutoring.html` | 123 | Tutoring Dashboard page |
-| `static/css/style.css` | 40 | Custom styling |
-| `static/js/main.js` | 169 | Client-side JS (validation, DRY helpers, chat, auto-calc) |
-| `.env` | 2 | Environment template |
-| `requirements.txt` | 4 | Python dependencies |
-| `README.md` | ~100 | Professional doc with backup/restore guide |
-
-### QA & Security Summary
-| Measure | Detail |
-|---------|--------|
-| Auto-backup | `database/backup.py` — async copy on shutdown, keeps last 15 |
-| Input validation | All POST routes: type checks, range checks, length limits |
-| File upload safety | Sanitized filenames, extension whitelist, 10MB limit |
-| Client-side validation | JS guards on both forms before submit |
-| String limits | `maxlength` attributes on all text inputs (200–500 chars) |
-| DRY refactoring | `setCategoryFromName()`, `escHtml()`, `statusMsg()`, `appendChatMessage()` helpers extracted |
-| FK integrity | Student existence verified before session insert |
-| Tested | 15/15 QA tests passing (pages, CRUD, edge cases, APIs, persistence) |
-
-### How to Run
 ```bash
-# 1. Set your Gemini API key
-echo "GEMINI_API_KEY=your_key_here" > .env
-
-# 2. Run the app
-python3 app.py
-
-# 3. Open browser at http://127.0.0.1:5000
+osascript -e 'display notification "تم التحقق من نظام الإشعارات الخارجي بنجاح!" with title "🔄 فحص نظام الماك" sound name "Glass"'
 ```
+> إذا ظهر طلب صلاحية من النظام، اضغط **Allow (سماح)** فوراً.
+
+### 1. تشغيل الديمون في الخلفية (Detached — يبقى شغال حتى لو أغلقت Terminal)
+
+```bash
+nohup /Users/yazannajem/Desktop/AI\ Project/venv/bin/python3 \
+  /Users/yazannajem/Desktop/AI\ Project/services/standalone_autopilot_daemon.py \
+  > /tmp/com.user.autopilot.out 2>/tmp/com.user.autopilot.err &
+```
+
+### 2. التحقق من أن الديمون شغال
+
+```bash
+ps aux | grep autopilot | grep -v grep
+```
+يعرض PID + مسار السكريبت.
+
+### 3. مراقعة السجلات (Logs)
+
+```bash
+# مخرجات النجاح والدورات
+cat /tmp/com.user.autopilot.out
+
+# أخطاء الصلاحيات أو المسارات
+cat /tmp/com.user.autopilot.err
+```
+
+### 4. إيقاف الديمون
+
+```bash
+kill $(pgrep -f standalone_autopilot_daemon)
+```
+
+### 5. إعادة التشغيل بعد إقلاع الماك (Login Item)
+
+أضف الأمر من خطوة 1 إلى **System Settings → General → Login Items** كـ Login Item ليشتغل تلقائياً كل ما تسجل دخولك.
+
+### Troubleshooting: macOS Notification Permissions
+
+1. **System Settings → Notifications → Terminal**
+   - Allow Notifications = **ON**
+   - Banner style (ليس None)
+
+2. **Do Not Disturb** — تأكد من إيقافه أثناء الفحص
+
+3. **Notification لا يظهر** — جرب هذا الأمر المباشر:
+   ```bash
+   osascript -e 'display notification "test" with title "test" sound name "Glass"'
+   ```
+   إذا اشتغل → المشكلة في الديمون. إذا ما اشتغل → صلاحية Terminal في System Settings.
+
+---
+
+## Summary of Files
+
+| File | Purpose | New/Existing |
+|------|---------|-------------|
+| `services/standalone_autopilot_daemon.py` | Persistent `while True` terminal loop, direct `osascript`, 300s polling | **REWRITTEN** (v3) |
+| `services/autopilot.py` | Shared scenario logic (reused by Flask + daemon) | Existing |
+| `services/desktop_notifier.py` | Direct `osascript` via `subprocess.run`, error logging | **REWRITTEN** |
+| `app.py` (endpoint) | `GET /api/reminders/upcoming` — returns active reminders sorted by computed due date with `days_remaining` | **NEW** |
+| `react-frontend/src/ExpensesDashboard.jsx` | Upcoming Commitments Timeline replaced hardcoded data with dynamic fetch from `/api/reminders/upcoming` | **MODIFIED** |
+| `venv/` | Python virtual environment | **NEW** |
+| `database/db.py` | `get_db()` with `timeout=30.0` + autopilot indexes | Modified |
+| `SYSTEM_BLUEPRINT.md` | Architecture, schema, activation, PENDING_TASKS | **Updated** |

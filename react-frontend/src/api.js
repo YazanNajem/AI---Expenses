@@ -1,9 +1,10 @@
-const BASE = 'http://127.0.0.1:8080';
-
 async function request(url, opts = {}) {
-  const r = await fetch(BASE + url, {
-    headers: { 'Content-Type': 'application/json', ...opts.headers },
-    ...opts
+  const { headers: extraHeaders, ...restOpts } = opts;
+  const r = await fetch(url, {
+    headers: { 'Content-Type': 'application/json', ...extraHeaders },
+    credentials: 'include',
+    mode: 'cors',
+    ...restOpts,
   });
   return r.json();
 }
@@ -18,9 +19,11 @@ export function fetchDashboardStats() {
 }
 
 export function addSession(data) {
-  return fetch(BASE + '/tutoring/add', {
+  return fetch('/tutoring/add', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    credentials: 'include',
+    mode: 'cors',
     body: new URLSearchParams(data)
   }).then(async r => {
     if (!r.ok) { const text = await r.text(); throw new Error(r.status === 405 ? 'Backend route not found (405)' : `HTTP ${r.status}`); }
@@ -41,9 +44,11 @@ export function deleteSession(sessionId) {
 }
 
 export function addStudent(data) {
-  return fetch(BASE + '/tutoring/add-student', {
+  return fetch('/tutoring/add-student', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    credentials: 'include',
+    mode: 'cors',
     body: new URLSearchParams(data)
   }).then(r => r.json());
 }

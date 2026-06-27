@@ -4,6 +4,7 @@ import 'bootstrap/dist/css/bootstrap.min.css';
 import { Chart as ChartJS, CategoryScale, LinearScale, BarElement, ArcElement, Title, Tooltip, Legend } from 'chart.js';
 import { Pie } from 'react-chartjs-2';
 import { fetchTutoringData, addSession, editSession, deleteSession, addStudent, editStudent, deleteStudent, fetchStudentData } from './api';
+import { AuthProvider, ProtectedRoute } from './AuthContext';
 import { fmtAED, sendWhatsApp, generateInvoice } from './helpers';
 import ExpensesDashboard from './ExpensesDashboard';
 import LandingPage from './LandingPage';
@@ -11,11 +12,12 @@ import Login from './Login';
 import Register from './Register';
 import PortfolioDashboard from './PortfolioDashboard';
 import StudentProfile from './StudentProfile';
+import AccountSettings from './AccountSettings';
 import NotFoundPage from './NotFoundPage';
 import LoadingScreen from './LoadingScreen';
 import { useUndo } from './hooks/useUndo';
 import SmartStudentSelector from './SmartStudentSelector';
-import { Eye, EyeOff, Pencil, Trash2, FileText, MessageCircle, FileSpreadsheet, Sun, Moon, Monitor, Plus, RotateCcw } from 'lucide-react';
+import { Eye, EyeOff, Pencil, Trash2, FileText, MessageCircle, FileSpreadsheet, Sun, Moon, Monitor, Plus, RotateCcw, Settings as SettingsIcon } from 'lucide-react';
 import logoImage from './assets/logo.png';
 
 ChartJS.register(CategoryScale, LinearScale, BarElement, ArcElement, Title, Tooltip, Legend);
@@ -476,6 +478,7 @@ function AppNavbar({ theme, setTheme, onExport, showExport }) {
         <div ref={linksRef} style={{ display: 'flex', gap: '0.125rem', position: 'relative', zIndex: 1 }}>
           <Link className={`nav-link ${path === '/expenses' ? 'active' : ''}`} to="/expenses">Expenses</Link>
           <Link className={`nav-link ${path === '/tutoring' ? 'active' : ''}`} to="/tutoring">Tutoring</Link>
+          <Link className={`nav-link ${path === '/settings' ? 'active' : ''}`} to="/settings"><SettingsIcon size={14} strokeWidth={2} style={{ marginRight: 4 }} />Settings</Link>
         </div>
       </div>
 
@@ -802,18 +805,19 @@ function Main() {
     return () => document.removeEventListener('mousedown', runStrictClickAnalysis);
   }, [isReminderModalOpen]);
 
-  const validPaths = ['/', '/dashboard', '/tutoring', '/expenses', '/portfolio'];
+  const validPaths = ['/', '/dashboard', '/tutoring', '/expenses', '/portfolio', '/settings'];
   const isKnownRoute = validPaths.includes(location.pathname) || /^\/student\/\d+$/.test(location.pathname);
   return (
     <div className={`min-vh-100 ${effectiveTheme === 'dark' ? 'theme-dark bg-dark text-white' : 'theme-light bg-light text-dark'}`} style={{ paddingTop: isKnownRoute ? 96 : 0 }}>
       {isKnownRoute && <AppNavbar theme={theme} setTheme={setTheme} onExport={() => {}} showExport={false} />}
       <Routes>
         <Route path="/" element={<LandingPage />} />
-        <Route path="/dashboard" element={<ExpensesDashboard wallet={wallet} setWallet={setWallet} showToast={showToast} effectiveTheme={effectiveTheme} reminderVersion={reminderVersion} setIsReminderModalOpen={setIsReminderModalOpen} onEditReminder={handleEditReminderClick} blurExpenses={blurExpenses} toggleBlurExpenses={toggleBlurExpenses} />} />
-        <Route path="/tutoring" element={<TutoringDashboard wallet={wallet} setWallet={setWallet} effectiveTheme={effectiveTheme} blurStudents={blurStudents} toggleBlurStudents={toggleBlurStudents} showToast={showToast} />} />
-        <Route path="/student/:id" element={<StudentProfile effectiveTheme={effectiveTheme} showToast={showToast} />} />
-        <Route path="/expenses" element={<ExpensesDashboard wallet={wallet} setWallet={setWallet} showToast={showToast} effectiveTheme={effectiveTheme} reminderVersion={reminderVersion} setIsReminderModalOpen={setIsReminderModalOpen} onEditReminder={handleEditReminderClick} blurExpenses={blurExpenses} toggleBlurExpenses={toggleBlurExpenses} />} />
-        <Route path="/portfolio" element={<PortfolioDashboard effectiveTheme={effectiveTheme} blurExpenses={blurExpenses} toggleBlurExpenses={toggleBlurExpenses} />} />
+        <Route path="/dashboard" element={<ProtectedRoute><ExpensesDashboard wallet={wallet} setWallet={setWallet} showToast={showToast} effectiveTheme={effectiveTheme} reminderVersion={reminderVersion} setIsReminderModalOpen={setIsReminderModalOpen} onEditReminder={handleEditReminderClick} blurExpenses={blurExpenses} toggleBlurExpenses={toggleBlurExpenses} /></ProtectedRoute>} />
+        <Route path="/tutoring" element={<ProtectedRoute><TutoringDashboard wallet={wallet} setWallet={setWallet} effectiveTheme={effectiveTheme} blurStudents={blurStudents} toggleBlurStudents={toggleBlurStudents} showToast={showToast} /></ProtectedRoute>} />
+        <Route path="/student/:id" element={<ProtectedRoute><StudentProfile effectiveTheme={effectiveTheme} showToast={showToast} /></ProtectedRoute>} />
+        <Route path="/expenses" element={<ProtectedRoute><ExpensesDashboard wallet={wallet} setWallet={setWallet} showToast={showToast} effectiveTheme={effectiveTheme} reminderVersion={reminderVersion} setIsReminderModalOpen={setIsReminderModalOpen} onEditReminder={handleEditReminderClick} blurExpenses={blurExpenses} toggleBlurExpenses={toggleBlurExpenses} /></ProtectedRoute>} />
+        <Route path="/portfolio" element={<ProtectedRoute><PortfolioDashboard effectiveTheme={effectiveTheme} blurExpenses={blurExpenses} toggleBlurExpenses={toggleBlurExpenses} /></ProtectedRoute>} />
+        <Route path="/settings" element={<ProtectedRoute><AccountSettings effectiveTheme={effectiveTheme} theme={theme} setTheme={setTheme} showToast={showToast} /></ProtectedRoute>} />
         <Route path="/login" element={<Login />} />
         <Route path="/register" element={<Register />} />
         <Route path="*" element={<NotFoundPage />} />
@@ -878,7 +882,9 @@ function Main() {
 export default function App() {
   return (
     <BrowserRouter>
-      <Main />
+      <AuthProvider>
+        <Main />
+      </AuthProvider>
     </BrowserRouter>
   );
 }

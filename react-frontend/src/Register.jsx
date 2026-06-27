@@ -1,14 +1,115 @@
 import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { ArrowLeft, Sparkles, CheckCircle, Fingerprint, Eye, EyeOff, Lock } from 'lucide-react';
+import { useAuth } from './AuthContext';
+
+function b64toUint(b64) {
+  return Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+}
+
+function uintToB64(buf) {
+  const bytes = new Uint8Array(buf);
+  let bin = '';
+  bytes.forEach(b => bin += String.fromCharCode(b));
+  return btoa(bin);
+}
 
 export default function Register() {
   const navigate = useNavigate();
+  const { register } = useAuth();
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [focused, setFocused] = useState(null);
+  const [error, setError] = useState('');
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  async function migrateLegacyData() {
+    const metaKeys = [
+      'customCategoryMeta', 'expenses_spent_override', 'loanMeta',
+      'cashPaymentTxns', 'cashWithdrawalTxns', 'portfolio_weight_overrides',
+      'theme',
+    ];
+    const legacyMetadata = {};
+    for (const k of metaKeys) {
+      const v = localStorage.getItem(k);
+      if (v !== null) legacyMetadata[k] = v;
+    }
+    if (Object.keys(legacyMetadata).length) {
+      try {
+        await fetch('/api/auth/migrate-legacy', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({ legacyMetadata }),
+        });
+      } catch {}
+    }
+    const cleanupKeys = ['daily_tasks_list', 'lastKnownCryptoPrice'];
+    cleanupKeys.forEach(k => localStorage.removeItem(k));
+  }
+
+  async function handleRegister() {
+    setError('');
+    if (!name || !email || !password) { setError('Please fill in all fields'); return; }
+    if (!email.includes('@')) { setError('Invalid email address'); return; }
+    if (password.length < 12) { setError('Password must be at least 12 characters'); return; }
+    setIsSubmitting(true);
+    try {
+      await register(name, email, password);
+      await migrateLegacyData();
+      navigate('/dashboard', { replace: true });
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  async function handlePasskeyRegister() {
+    setError('');
+    if (!name || !email || !password) { setError('Fill in all fields first to register a passkey'); return; }
+    try {
+      const loginRes = await fetch('/api/auth/login', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ email, password }),
+      });
+      if (!loginRes.ok) {
+        const loginErr = await loginRes.json();
+        throw new Error(loginErr.error || 'Login failed before passkey registration');
+      }
+      const beginRes = await fetch('/api/auth/webauthn/register/begin', {
+        method: 'POST', credentials: 'include',
+      });
+      if (!beginRes.ok) {
+        const err = await beginRes.json();
+        throw new Error(err.error || 'Passkey registration unavailable');
+      }
+      const opts = await beginRes.json();
+      const pubKey = {
+        ...opts,
+        challenge: b64toUint(opts.challenge).buffer,
+        user: { ...opts.user, id: b64toUint(opts.user.id).buffer },
+      };
+      const cred = await navigator.credentials.create({ publicKey: pubKey });
+      const completeRes = await fetch('/api/auth/webauthn/register/complete', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({
+          id: cred.id,
+          response: { publicKey: uintToB64(cred.response.getPublicKey()) },
+        }),
+      });
+      const result = await completeRes.json();
+      if (!completeRes.ok) throw new Error(result.error || 'Passkey registration failed');
+      navigate('/dashboard', { replace: true });
+    } catch (e) {
+      if (e.name === 'NotAllowedError') return;
+      setError(e.message);
+    }
+  }
+
   return (
     <div style={{ position: 'relative', minHeight: '100vh', overflow: 'hidden', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '24px' }}>
       <div style={{ position: 'absolute', inset: 0, zIndex: 0, pointerEvents: 'none' }}>
@@ -24,24 +125,26 @@ export default function Register() {
           <p className="text-muted small" style={{ fontSize: '0.75rem' }}>Create your VaultTrack account</p>
         </div>
         <div style={{ position: 'relative', marginBottom: '18px' }}>
-          <input className="form-control" type="text" value={name} onChange={e => setName(e.target.value)} onFocus={() => setFocused('name')} onBlur={() => setFocused(null)} placeholder=" " style={{ width: '100%', height: '52px', padding: '18px 36px 6px 14px', fontSize: '0.85rem', backgroundColor: 'transparent', border: '1px solid rgba(128,128,128,0.2)', borderRadius: '12px', color: 'inherit', outline: 'none', transition: 'border-color 0.2s, box-shadow 0.2s', boxShadow: focused === 'name' ? '0 0 0 2px rgba(245,158,11,0.25)' : 'none', borderColor: focused === 'name' ? '#f59e0b' : 'rgba(128,128,128,0.2)' }} />
+          <input className="form-control" type="text" value={name} onChange={e => { setName(e.target.value); setError(''); }} onFocus={() => setFocused('name')} onBlur={() => setFocused(null)} placeholder=" " style={{ width: '100%', height: '52px', padding: '18px 36px 6px 14px', fontSize: '0.85rem', backgroundColor: 'transparent', border: '1px solid rgba(128,128,128,0.2)', borderRadius: '12px', color: 'inherit', outline: 'none', transition: 'border-color 0.2s, box-shadow 0.2s', boxShadow: focused === 'name' ? '0 0 0 2px rgba(245,158,11,0.25)' : 'none', borderColor: focused === 'name' ? '#f59e0b' : 'rgba(128,128,128,0.2)' }} />
           <span style={{ position: 'absolute', left: '14px', top: (focused === 'name' || name) ? '6px' : '50%', transform: (focused === 'name' || name) ? 'translateY(0)' : 'translateY(-50%)', fontSize: (focused === 'name' || name) ? '0.6rem' : '0.8rem', color: focused === 'name' ? '#f59e0b' : 'var(--text-muted)', transition: 'all 0.2s ease', pointerEvents: 'none', fontWeight: (focused === 'name' || name) ? 600 : 400, lineHeight: 1.2 }}>Full Name</span>
           {name && name.length > 0 && <CheckCircle size={14} style={{ position: 'absolute', right: '12px', top: '50%', transform: 'translateY(-50%)', color: '#10b981', pointerEvents: 'none' }} />}
         </div>
         <div style={{ position: 'relative', marginBottom: '18px' }}>
-          <input className="form-control" type="email" value={email} onChange={e => setEmail(e.target.value)} onFocus={() => setFocused('email')} onBlur={() => setFocused(null)} placeholder=" " style={{ width: '100%', height: '52px', padding: '18px 36px 6px 14px', fontSize: '0.85rem', backgroundColor: 'transparent', border: '1px solid rgba(128,128,128,0.2)', borderRadius: '12px', color: 'inherit', outline: 'none', transition: 'border-color 0.2s, box-shadow 0.2s', boxShadow: focused === 'email' ? '0 0 0 2px rgba(245,158,11,0.25)' : 'none', borderColor: focused === 'email' ? '#f59e0b' : 'rgba(128,128,128,0.2)' }} />
+          <input className="form-control" type="email" value={email} onChange={e => { setEmail(e.target.value); setError(''); }} onFocus={() => setFocused('email')} onBlur={() => setFocused(null)} placeholder=" " style={{ width: '100%', height: '52px', padding: '18px 36px 6px 14px', fontSize: '0.85rem', backgroundColor: 'transparent', border: '1px solid rgba(128,128,128,0.2)', borderRadius: '12px', color: 'inherit', outline: 'none', transition: 'border-color 0.2s, box-shadow 0.2s', boxShadow: focused === 'email' ? '0 0 0 2px rgba(245,158,11,0.25)' : 'none', borderColor: focused === 'email' ? '#f59e0b' : 'rgba(128,128,128,0.2)' }} />
           <span style={{ position: 'absolute', left: '14px', top: (focused === 'email' || email) ? '6px' : '50%', transform: (focused === 'email' || email) ? 'translateY(0)' : 'translateY(-50%)', fontSize: (focused === 'email' || email) ? '0.6rem' : '0.8rem', color: focused === 'email' ? '#f59e0b' : 'var(--text-muted)', transition: 'all 0.2s ease', pointerEvents: 'none', fontWeight: (focused === 'email' || email) ? 600 : 400, lineHeight: 1.2 }}>Email Address</span>
           {email && email.includes('@') && <CheckCircle size={14} style={{ position: 'absolute', right: '12px', top: '50%', transform: 'translateY(-50%)', color: '#10b981', pointerEvents: 'none' }} />}
         </div>
         <div style={{ position: 'relative', marginBottom: '18px' }}>
-          <input className="form-control" type={showPassword ? 'text' : 'password'} value={password} onChange={e => setPassword(e.target.value)} onFocus={() => setFocused('password')} onBlur={() => setFocused(null)} placeholder=" " style={{ width: '100%', height: '52px', padding: '18px 36px 6px 14px', fontSize: '0.85rem', backgroundColor: 'transparent', border: '1px solid rgba(128,128,128,0.2)', borderRadius: '12px', color: 'inherit', outline: 'none', transition: 'border-color 0.2s, box-shadow 0.2s', boxShadow: focused === 'password' ? '0 0 0 2px rgba(245,158,11,0.25)' : 'none', borderColor: focused === 'password' ? '#f59e0b' : 'rgba(128,128,128,0.2)' }} />
+          <input className="form-control" type={showPassword ? 'text' : 'password'} value={password} onChange={e => { setPassword(e.target.value); setError(''); }} onFocus={() => setFocused('password')} onBlur={() => setFocused(null)} placeholder=" " style={{ width: '100%', height: '52px', padding: '18px 36px 6px 14px', fontSize: '0.85rem', backgroundColor: 'transparent', border: '1px solid rgba(128,128,128,0.2)', borderRadius: '12px', color: 'inherit', outline: 'none', transition: 'border-color 0.2s, box-shadow 0.2s', boxShadow: focused === 'password' ? '0 0 0 2px rgba(245,158,11,0.25)' : 'none', borderColor: focused === 'password' ? '#f59e0b' : 'rgba(128,128,128,0.2)' }} />
           <span style={{ position: 'absolute', left: '14px', top: (focused === 'password' || password) ? '6px' : '50%', transform: (focused === 'password' || password) ? 'translateY(0)' : 'translateY(-50%)', fontSize: (focused === 'password' || password) ? '0.6rem' : '0.8rem', color: focused === 'password' ? '#f59e0b' : 'var(--text-muted)', transition: 'all 0.2s ease', pointerEvents: 'none', fontWeight: (focused === 'password' || password) ? 600 : 400, lineHeight: 1.2 }}>Password</span>
           <div onClick={() => setShowPassword(!showPassword)} style={{ position: 'absolute', right: '12px', top: '50%', transform: 'translateY(-50%)', cursor: 'pointer', color: password.length >= 8 ? '#10b981' : 'var(--text-muted)', opacity: 0.5 }}>{showPassword ? <EyeOff size={14} /> : <Eye size={14} />}</div>
         </div>
-        <button className="landing-glow-btn w-100 justify-content-center mb-2" onClick={() => navigate('/dashboard')}>Create Account</button>
-        <button style={{ width: '100%', padding: '11px', borderRadius: '12px', backgroundColor: 'rgba(255,255,255,0.04)', border: '1px solid rgba(128,128,128,0.12)', backdropFilter: 'blur(8px)', color: 'inherit', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px', cursor: 'pointer', transition: 'all 0.3s', marginBottom: '18px', fontSize: '0.8rem', fontWeight: 500 }}
-          onMouseEnter={e => { e.target.style.borderColor = 'rgba(245,158,11,0.4)'; e.target.style.boxShadow = '0 0 12px rgba(245,158,11,0.12)'; }}
-          onMouseLeave={e => { e.target.style.borderColor = 'rgba(128,128,128,0.12)'; e.target.style.boxShadow = 'none'; }}>
+        {error && <div style={{ color: '#ef4444', fontSize: '0.75rem', textAlign: 'center', marginBottom: '12px', padding: '6px 12px', backgroundColor: 'rgba(239,68,68,0.1)', borderRadius: '8px' }}>{error}</div>}
+        <button type="button" className="landing-glow-btn w-100 justify-content-center mb-2" onClick={handleRegister} disabled={isSubmitting} style={{ opacity: isSubmitting ? 0.6 : 1 }}>{isSubmitting ? 'Creating account…' : 'Create Account'}</button>
+        <button style={{ width: '100%', padding: '11px', borderRadius: '12px', backgroundColor: 'rgba(255,255,255,0.04)', border: '1px solid rgba(128,128,128,0.12)', backdropFilter: 'blur(8px)', color: 'inherit', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px', cursor: 'pointer', transition: 'all 0.3s', marginBottom: '18px', fontSize: '0.8rem', fontWeight: 500, opacity: 0.75 }}
+          onClick={handlePasskeyRegister}
+          onMouseEnter={e => { e.target.style.borderColor = 'rgba(245,158,11,0.4)'; e.target.style.boxShadow = '0 0 12px rgba(245,158,11,0.12)'; e.target.style.opacity = '1'; }}
+          onMouseLeave={e => { e.target.style.borderColor = 'rgba(128,128,128,0.12)'; e.target.style.boxShadow = 'none'; e.target.style.opacity = '0.75'; }}>
           <Fingerprint size={17} />
           Register with Passkey
         </button>

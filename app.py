@@ -1,19 +1,36 @@
 from pathlib import Path
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 import requests
 import re
+import bcrypt
+import jwt as pyjwt
+from functools import wraps
+import secrets
+import hashlib
 
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 
-from database.db import get_db, init_db
+from database.db import get_db, init_db, DB_PATH
 from database.backup import backup_async
 from services.autopilot import scenario_a_student_session, scenario_b_expense_reconcile
 
 app = Flask(__name__)
-CORS(app)
+app.config['SECRET_KEY'] = app.config.get('SECRET_KEY') or secrets.token_hex(32)
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = 900
+app.config['JWT_REFRESH_TOKEN_EXPIRES'] = 604800
+app.config['RATE_LIMIT_MAX_ATTEMPTS'] = 5
+app.config['RATE_LIMIT_WINDOW_MINUTES'] = 15
+app.config['ACCOUNT_LOCKOUT_MINUTES'] = 15
+app.config['SESSION_COOKIE_SAMESITE'] = 'None'
+app.config['SESSION_COOKIE_SECURE'] = False
+app.config['SESSION_COOKIE_HTTPONLY'] = False
+app.url_map.strict_slashes = False
+
+CORS(app, supports_credentials=True, resources={r"/api/*": {"origins": ["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:8080", "http://127.0.0.1:8080"]}}, methods=["GET", "POST", "OPTIONS", "PUT", "DELETE"])
 
 init_db()
+print(f"USING DATABASE AT: {DB_PATH.resolve()}", flush=True)
 
 # ── Schema migration: add completed_month to reminders ──
 try:
@@ -130,12 +147,239 @@ try:
 except Exception:
     pass
 
+# ── Schema migration: auth tables ──
+try:
+    _db = get_db()
+    _db.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            name TEXT NOT NULL DEFAULT '',
+            webauthn_credential_id TEXT,
+            webauthn_public_key TEXT,
+            locked_until TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS refresh_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            token_hash TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            revoked INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        );
+        CREATE TABLE IF NOT EXISTS login_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ip_address TEXT NOT NULL,
+            attempted_at TEXT NOT NULL DEFAULT (datetime('now')),
+            success INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_login_attempts_ip ON login_attempts(ip_address, attempted_at);
+        CREATE INDEX IF NOT EXISTS idx_refresh_tokens_hash ON refresh_tokens(token_hash);
+        CREATE TABLE IF NOT EXISTS user_legacy_data (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            data_type TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            migrated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_legacy_data_user ON user_legacy_data(user_id);
+    """)
+    _db.commit()
+    _db.close()
+except Exception:
+    pass
+
 # Register non-blocking backup on shutdown
 import atexit
 DB_PATH = Path(__file__).parent / 'database' / 'finance.db'
 atexit.register(backup_async, str(DB_PATH))
 
 MAX_STRING_LEN = 500
+
+# ─── Auth Utilities ───
+
+def hash_password(password):
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt(rounds=12)).decode('utf-8')
+
+def verify_password(password, password_hash):
+    return bcrypt.checkpw(password.encode('utf-8'), password_hash.encode('utf-8'))
+
+def create_access_token(user_id):
+    payload = {
+        'user_id': user_id,
+        'exp': datetime.now(timezone.utc) + timedelta(seconds=app.config['JWT_ACCESS_TOKEN_EXPIRES']),
+        'iat': datetime.now(timezone.utc),
+        'type': 'access'
+    }
+    return pyjwt.encode(payload, app.config['SECRET_KEY'], algorithm='HS256')
+
+def decode_access_token(token):
+    try:
+        payload = pyjwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
+        if payload.get('type') != 'access':
+            return None
+        return payload['user_id']
+    except (pyjwt.ExpiredSignatureError, pyjwt.InvalidTokenError):
+        return None
+
+def create_refresh_token(user_id):
+    token = secrets.token_urlsafe(64)
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    expires_at = (datetime.now(timezone.utc) + timedelta(seconds=app.config['JWT_REFRESH_TOKEN_EXPIRES'])).isoformat()
+    db = get_db()
+    db.execute("INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)",
+               (user_id, token_hash, expires_at))
+    db.commit()
+    db.close()
+    return token
+
+def verify_refresh_token(token):
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    db = get_db()
+    row = db.execute(
+        "SELECT id, user_id, expires_at, revoked FROM refresh_tokens WHERE token_hash=? AND revoked=0",
+        (token_hash,)
+    ).fetchone()
+    if not row:
+        db.close()
+        return None
+    expires = datetime.fromisoformat(row['expires_at'])
+    if expires < datetime.now(timezone.utc) or row['revoked']:
+        db.close()
+        return None
+    db.close()
+    return row['user_id']
+
+def revoke_refresh_token(token):
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    db = get_db()
+    db.execute("UPDATE refresh_tokens SET revoked=1 WHERE token_hash=?", (token_hash,))
+    db.commit()
+    db.close()
+
+def rotate_refresh_token(old_token, user_id):
+    revoke_refresh_token(old_token)
+    return create_refresh_token(user_id)
+
+def get_client_ip():
+    return request.headers.get('X-Forwarded-For', request.remote_addr or '127.0.0.1').split(',')[0].strip()
+
+def check_rate_limit():
+    ip = get_client_ip()
+    window = app.config['RATE_LIMIT_WINDOW_MINUTES']
+    max_attempts = app.config['RATE_LIMIT_MAX_ATTEMPTS']
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=window)).isoformat()
+    db = get_db()
+    count = db.execute(
+        "SELECT COUNT(*) FROM login_attempts WHERE ip_address=? AND attempted_at>? AND success=0",
+        (ip, cutoff)
+    ).fetchone()[0]
+    db.close()
+    return count < max_attempts
+
+def record_login_attempt(ip, success):
+    db = get_db()
+    db.execute("INSERT INTO login_attempts (ip_address, success) VALUES (?, ?)", (ip, 1 if success else 0))
+    db.commit()
+    db.close()
+
+def is_account_locked(email):
+    db = get_db()
+    user = db.execute("SELECT locked_until FROM users WHERE email=?", (email,)).fetchone()
+    db.close()
+    if not user or not user['locked_until']:
+        return False
+    locked_until = datetime.fromisoformat(user['locked_until'])
+    return locked_until > datetime.now(timezone.utc)
+
+def lock_account(email):
+    lock_until = (datetime.now(timezone.utc) + timedelta(minutes=app.config['ACCOUNT_LOCKOUT_MINUTES'])).isoformat()
+    db = get_db()
+    db.execute("UPDATE users SET locked_until=? WHERE email=?", (lock_until, email))
+    db.commit()
+    db.close()
+
+def is_weak_password(password):
+    if len(password) < 12:
+        return True
+    if not re.search(r'[A-Z]', password):
+        return True
+    if not re.search(r'[a-z]', password):
+        return True
+    if not re.search(r'[0-9]', password):
+        return True
+    if not re.search(r'[!@#$%^&*(),.?":{}|<>_\-+=\[\]\\;~`]', password):
+        return True
+    return False
+
+# ─── Auth Middleware ───
+
+def jwt_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = None
+        auth_header = request.headers.get('Authorization', '')
+        if auth_header.startswith('Bearer '):
+            token = auth_header[7:]
+        if not token:
+            token = request.cookies.get('access_token_cookie')
+        if not token:
+            return jsonify({'error': 'Authentication required'}), 401
+        user_id = decode_access_token(token)
+        if user_id is None:
+            return jsonify({'error': 'Invalid or expired token'}), 401
+        return f(user_id=user_id, *args, **kwargs)
+    return decorated
+
+# ─── API Authentication Guard ───
+
+@app.before_request
+def authenticate_api_requests():
+    if request.method == 'OPTIONS':
+        resp = jsonify({'ok': True})
+        resp.status_code = 200
+        origin = request.headers.get('Origin', '')
+        if origin:
+            resp.headers['Access-Control-Allow-Origin'] = origin
+        resp.headers['Access-Control-Allow-Credentials'] = 'true'
+        resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Requested-With'
+        resp.headers['Access-Control-Max-Age'] = '3600'
+        return resp
+    if request.path.startswith('/api/auth/'):
+        return None
+    if request.path.startswith('/api/'):
+        token = None
+        auth_header = request.headers.get('Authorization', '')
+        if auth_header.startswith('Bearer '):
+            token = auth_header[7:]
+        if not token:
+            token = request.cookies.get('access_token_cookie')
+        if not token:
+            return jsonify({'error': 'Authentication required'}), 401
+        user_id = decode_access_token(token)
+        if user_id is None:
+            if request.cookies.get('refresh_token_cookie'):
+                return jsonify({'error': 'Token expired', 'code': 'TOKEN_EXPIRED'}), 401
+            return jsonify({'error': 'Authentication required'}), 401
+    return None
+
+# ─── Security Headers ───
+
+@app.after_request
+def add_security_headers(response):
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    response.headers['Content-Security-Policy'] = "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:; script-src * 'unsafe-inline' 'unsafe-eval' https://cdnjs.cloudflare.com; style-src * 'unsafe-inline'; img-src * data: blob:; font-src * data:; connect-src *"
+    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    response.headers['Permissions-Policy'] = 'camera=(), microphone=(), geolocation=()'
+    return response
 
 
 def fmt(amount):
@@ -882,7 +1126,7 @@ def api_expenses():
         wallet_db.close()
         return jsonify({
             'summary': {
-                'total_expenses': ms_from_wallet,
+                'total_expenses': s['total_expenses'],
                 'total_assets': s['total_assets'],
                 'total_deducted': s['total_deducted']
             },
@@ -1799,12 +2043,341 @@ def db_integrated_chat():
         return jsonify({'reply': f'Could not reach the local AI engine.'})
 
 
+# ─── Auth Routes ───
+
+def _set_auth_cookies(response, access_token, refresh_token):
+    is_local = request.host.startswith('127.0.0.1') or request.host.startswith('localhost')
+    response.set_cookie(
+        'access_token_cookie', access_token,
+        httponly=True, secure=not is_local, samesite='None',
+        max_age=app.config['JWT_ACCESS_TOKEN_EXPIRES'], path='/'
+    )
+    response.set_cookie(
+        'refresh_token_cookie', refresh_token,
+        httponly=True, secure=not is_local, samesite='None',
+        max_age=app.config['JWT_REFRESH_TOKEN_EXPIRES'], path='/api/auth'
+    )
+
+def _clear_auth_cookies(response):
+    response.set_cookie('access_token_cookie', '', httponly=True, max_age=0, path='/')
+    response.set_cookie('refresh_token_cookie', '', httponly=True, max_age=0, path='/api/auth')
+
+@app.route('/api/auth/register', methods=['POST', 'OPTIONS'], strict_slashes=False)
+def api_auth_register():
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    try:
+        data = request.get_json(force=True, silent=True)
+        if not data and request.data:
+            import json
+            try:
+                data = json.loads(request.data.decode('utf-8'))
+            except:
+                data = {}
+        if not data:
+            data = request.form.to_dict()
+        print(f"--- AUTH ATTEMPT --- Payload Received: {data}", flush=True)
+        name = (data.get('name') or '').strip()
+        email = ((data.get('email') or '').strip()).lower()
+        password = data.get('password', '')
+        if not name:
+            return jsonify({'error': 'Name is required'}), 400
+        if not email or '@' not in email or '.' not in email:
+            return jsonify({'error': 'Invalid email address'}), 400
+        if is_weak_password(password):
+            return jsonify({'error': 'Password must be at least 12 characters with uppercase, lowercase, number, and symbol'}), 400
+        db = get_db()
+        existing = db.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
+        if existing:
+            db.close()
+            return jsonify({'error': 'An account with this email already exists'}), 409
+        password_hash = hash_password(password)
+        cur = db.execute(
+            "INSERT INTO users (email, password_hash, name) VALUES (?, ?, ?)",
+            (email, password_hash, name)
+        )
+        user_id = cur.lastrowid
+        db.commit()
+        access_token = create_access_token(user_id)
+        refresh_token = create_refresh_token(user_id)
+        record_login_attempt(get_client_ip(), True)
+        db.close()
+        resp = jsonify({'success': True, 'user': {'id': user_id, 'email': email, 'name': name}})
+        _set_auth_cookies(resp, access_token, refresh_token)
+        return resp, 201
+    except Exception as e:
+        return jsonify({'error': 'Registration failed'}), 500
+
+@app.route('/api/auth/login', methods=['POST', 'OPTIONS'], strict_slashes=False)
+def api_auth_login():
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    try:
+        ip = get_client_ip()
+        if not check_rate_limit():
+            return jsonify({'error': 'Too many attempts. Please wait 15 minutes.'}), 429
+        data = request.get_json(force=True, silent=True)
+        if not data and request.data:
+            import json
+            try:
+                data = json.loads(request.data.decode('utf-8'))
+            except:
+                data = {}
+        if not data:
+            data = request.form.to_dict()
+        print(f"--- AUTH ATTEMPT --- Payload Received: {data}", flush=True)
+        email = ((data.get('email') or '').strip()).lower()
+        password = data.get('password', '')
+        print(f"--- LOGIN TRACE --- Extracted email: '{email}', password length: {len(password)}", flush=True)
+        if not email or not password:
+            return jsonify({'error': 'Invalid credentials'}), 401
+        if is_account_locked(email):
+            return jsonify({'error': 'Account temporarily locked. Try again in 15 minutes.'}), 423
+        db = get_db()
+        user = db.execute("SELECT id, email, name, password_hash FROM users WHERE email=?", (email,)).fetchone()
+        print(f"--- LOGIN TRACE --- User found: {user is not None}", flush=True)
+        if not user or not verify_password(password, user['password_hash']):
+            print(f"--- LOGIN TRACE --- Password check: FAILED" if not user else f"--- LOGIN TRACE --- Password check: FAILED (hash mismatch)", flush=True)
+            record_login_attempt(ip, False)
+            failed_count = db.execute(
+                "SELECT COUNT(*) FROM login_attempts WHERE ip_address=? AND success=0 AND attempted_at>?",
+                (ip, (datetime.now(timezone.utc) - timedelta(minutes=app.config['RATE_LIMIT_WINDOW_MINUTES'])).isoformat())
+            ).fetchone()[0]
+            db.close()
+            if failed_count >= app.config['RATE_LIMIT_MAX_ATTEMPTS']:
+                lock_account(email)
+                return jsonify({'error': 'Account locked due to multiple failed attempts. Try again in 15 minutes.'}), 423
+            return jsonify({'error': 'Invalid credentials'}), 401
+        record_login_attempt(ip, True)
+        print(f"--- LOGIN TRACE --- Password check: PASSED for user {user['id']}", flush=True)
+        access_token = create_access_token(user['id'])
+        refresh_token = create_refresh_token(user['id'])
+        db.close()
+        resp = jsonify({'success': True, 'user': {'id': user['id'], 'email': user['email'], 'name': user['name']}})
+        _set_auth_cookies(resp, access_token, refresh_token)
+        return resp
+    except Exception as e:
+        return jsonify({'error': 'Login failed'}), 500
+
+@app.route('/api/auth/refresh', methods=['POST'])
+def api_auth_refresh():
+    try:
+        refresh_token = request.cookies.get('refresh_token_cookie')
+        if not refresh_token:
+            return jsonify({'error': 'Refresh token missing'}), 401
+        user_id = verify_refresh_token(refresh_token)
+        if user_id is None:
+            resp = jsonify({'error': 'Invalid refresh token'})
+            _clear_auth_cookies(resp)
+            return resp, 401
+        new_access_token = create_access_token(user_id)
+        new_refresh_token = rotate_refresh_token(refresh_token, user_id)
+        resp = jsonify({'success': True})
+        _set_auth_cookies(resp, new_access_token, new_refresh_token)
+        return resp
+    except Exception as e:
+        return jsonify({'error': 'Token refresh failed'}), 500
+
+@app.route('/api/auth/logout', methods=['POST'])
+def api_auth_logout():
+    refresh_token = request.cookies.get('refresh_token_cookie')
+    if refresh_token:
+        try:
+            revoke_refresh_token(refresh_token)
+        except Exception:
+            pass
+    resp = jsonify({'success': True})
+    _clear_auth_cookies(resp)
+    return resp
+
+@app.route('/api/auth/me')
+def api_auth_me():
+    try:
+        token = request.cookies.get('access_token_cookie')
+        if not token:
+            auth = request.headers.get('Authorization', '')
+            if auth.startswith('Bearer '):
+                token = auth[7:]
+        if not token:
+            return jsonify({'error': 'Not authenticated'}), 401
+        user_id = decode_access_token(token)
+        if user_id is None:
+            refresh_token = request.cookies.get('refresh_token_cookie')
+            if refresh_token:
+                return jsonify({'error': 'Token expired', 'code': 'TOKEN_EXPIRED'}), 401
+            return jsonify({'error': 'Not authenticated'}), 401
+        db = get_db()
+        user = db.execute("SELECT id, email, name FROM users WHERE id=?", (user_id,)).fetchone()
+        db.close()
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+        return jsonify({'user': {'id': user['id'], 'email': user['email'], 'name': user['name']}})
+    except Exception as e:
+        return jsonify({'error': 'Authentication check failed'}), 500
+
+# ─── Legacy Data Migration ───
+
+LEGACY_TABLES = ['expenses', 'categories', 'reminders', 'students', 'tutoring_sessions', 'wallet']
+
+def _ensure_user_id_column(table):
+    db = get_db()
+    cols = [r['name'] for r in db.execute(f"PRAGMA table_info({table})").fetchall()]
+    db.close()
+    if 'user_id' not in cols:
+        db = get_db()
+        db.execute(f"ALTER TABLE {table} ADD COLUMN user_id INTEGER DEFAULT NULL")
+        db.commit()
+        db.close()
+
+def _adopt_orphaned_rows(table, user_id):
+    db = get_db()
+    db.execute(f"UPDATE {table} SET user_id=? WHERE user_id IS NULL", (user_id,))
+    db.commit()
+    db.close()
+
+@app.route('/api/auth/migrate-legacy', methods=['POST', 'OPTIONS'], strict_slashes=False)
+def api_migrate_legacy():
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    try:
+        token = request.cookies.get('access_token_cookie')
+        if not token:
+            auth = request.headers.get('Authorization', '')
+            if auth.startswith('Bearer '):
+                token = auth[7:]
+        if not token:
+            return jsonify({'error': 'Authentication required'}), 401
+        user_id = decode_access_token(token)
+        if user_id is None:
+            return jsonify({'error': 'Invalid token'}), 401
+        for table in LEGACY_TABLES:
+            _ensure_user_id_column(table)
+            _adopt_orphaned_rows(table, user_id)
+        data = request.get_json(silent=True) or {}
+        metadata = data.get('legacyMetadata')
+        if metadata is not None:
+            import json as _json
+            db = get_db()
+            db.execute(
+                "INSERT INTO user_legacy_data (user_id, data_type, payload) VALUES (?, ?, ?)",
+                (user_id, 'legacyMetadata', _json.dumps(metadata))
+            )
+            db.commit()
+            db.close()
+        return jsonify({'success': True, 'adopted_tables': LEGACY_TABLES})
+    except Exception as e:
+        return jsonify({'error': 'Migration failed'}), 500
+
+
+# ─── WebAuthn / Passkey ───
+
+@app.route('/api/auth/webauthn/register/begin', methods=['POST'])
+def api_webauthn_register_begin():
+    try:
+        refresh_token = request.cookies.get('refresh_token_cookie')
+        if not refresh_token:
+            return jsonify({'error': 'Authentication required'}), 401
+        user_id = verify_refresh_token(refresh_token)
+        if user_id is None:
+            return jsonify({'error': 'Invalid session'}), 401
+        db = get_db()
+        user = db.execute("SELECT id, email, name FROM users WHERE id=?", (user_id,)).fetchone()
+        db.close()
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+        challenge = secrets.token_urlsafe(32)
+        db = get_db()
+        db.execute("INSERT INTO app_settings (key, value) VALUES ('webauthn_challenge', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (challenge,))
+        db.commit()
+        db.close()
+        return jsonify({
+            'challenge': challenge,
+            'rp': {'name': 'VaultTrack', 'id': request.host.split(':')[0]},
+            'user': {'id': str(user['id']), 'name': user['email'], 'displayName': user['name']},
+            'pubKeyCredParams': [{'type': 'public-key', 'alg': -7}],
+            'timeout': 60000,
+            'attestation': 'none'
+        })
+    except Exception as e:
+        return jsonify({'error': 'Failed to initiate WebAuthn registration'}), 500
+
+@app.route('/api/auth/webauthn/register/complete', methods=['POST'])
+def api_webauthn_register_complete():
+    try:
+        refresh_token = request.cookies.get('refresh_token_cookie')
+        if not refresh_token:
+            return jsonify({'error': 'Authentication required'}), 401
+        user_id = verify_refresh_token(refresh_token)
+        if user_id is None:
+            return jsonify({'error': 'Invalid session'}), 401
+        data = request.get_json(silent=True) or {}
+        credential_id = data.get('id', '')
+        public_key = str(data.get('response', {}).get('publicKey', ''))
+        if not credential_id or not public_key:
+            return jsonify({'error': 'Invalid credential data'}), 400
+        db = get_db()
+        db.execute("UPDATE users SET webauthn_credential_id=?, webauthn_public_key=? WHERE id=?",
+                   (credential_id, public_key, user_id))
+        db.commit()
+        db.close()
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': 'Failed to complete WebAuthn registration'}), 500
+
+@app.route('/api/auth/webauthn/login/begin', methods=['POST'])
+def api_webauthn_login_begin():
+    try:
+        data = request.get_json(silent=True) or {}
+        email = ((data.get('email') or '').strip()).lower()
+        if not email:
+            return jsonify({'error': 'Email required'}), 400
+        db = get_db()
+        user = db.execute("SELECT id, email, name, webauthn_credential_id FROM users WHERE email=? AND webauthn_credential_id IS NOT NULL", (email,)).fetchone()
+        db.close()
+        if not user:
+            return jsonify({'error': 'No passkey registered for this email'}), 404
+        challenge = secrets.token_urlsafe(32)
+        db = get_db()
+        db.execute("INSERT INTO app_settings (key, value) VALUES ('webauthn_challenge', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (challenge,))
+        db.commit()
+        db.close()
+        return jsonify({
+            'challenge': challenge,
+            'allowCredentials': [{'type': 'public-key', 'id': user['webauthn_credential_id']}],
+            'timeout': 60000,
+            'rpId': request.host.split(':')[0]
+        })
+    except Exception as e:
+        return jsonify({'error': 'Failed to initiate WebAuthn login'}), 500
+
+@app.route('/api/auth/webauthn/login/complete', methods=['POST'])
+def api_webauthn_login_complete():
+    try:
+        data = request.get_json(silent=True) or {}
+        credential_id = data.get('id', '')
+        if not credential_id:
+            return jsonify({'error': 'Invalid credential'}), 400
+        db = get_db()
+        user = db.execute("SELECT id, email, name FROM users WHERE webauthn_credential_id=?", (credential_id,)).fetchone()
+        if not user:
+            db.close()
+            return jsonify({'error': 'Credential not found'}), 404
+        access_token = create_access_token(user['id'])
+        refresh_token = create_refresh_token(user['id'])
+        db.close()
+        resp = jsonify({'success': True, 'user': {'id': user['id'], 'email': user['email'], 'name': user['name']}})
+        _set_auth_cookies(resp, access_token, refresh_token)
+        return resp
+    except Exception as e:
+        return jsonify({'error': 'WebAuthn login failed'}), 500
+
+
 # ─── Serve React SPA ───
 
 REACT_DIST = Path(__file__).parent / 'react-frontend' / 'dist'
 
-@app.route('/', defaults={'path': ''})
-@app.route('/<path:path>')
+@app.route('/', defaults={'path': ''}, methods=['GET'])
+@app.route('/<path:path>', methods=['GET'])
 def serve_react_app(path):
     if path and (REACT_DIST / path).is_file():
         return send_from_directory(str(REACT_DIST), path)
@@ -1814,6 +2387,15 @@ def serve_react_app(path):
 def method_not_allowed(e):
     return jsonify({'error': 'Method not allowed', 'code': 405}), 405
 
+# ─── Print Registered Routes for Diagnostics ───
+print("=" * 60)
+print("REGISTERED ROUTES:")
+print("=" * 60)
+for rule in sorted(app.url_map.iter_rules(), key=lambda r: r.rule):
+    methods = sorted(rule.methods - {'HEAD', 'OPTIONS'})
+    if methods:
+        print(f"  {', '.join(methods):6s}  {rule.rule}")
+print("=" * 60)
 
 if __name__ == '__main__':
     app.run(debug=False, host='127.0.0.1', port=8080)

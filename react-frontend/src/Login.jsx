@@ -1,13 +1,87 @@
 import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { ArrowLeft, Sparkles, CheckCircle, Fingerprint, Eye, EyeOff, Lock } from 'lucide-react';
+import { useAuth } from './AuthContext';
+
+function b64toUint(b64) {
+  return Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+}
+
+function uintToB64(buf) {
+  const bytes = new Uint8Array(buf);
+  let bin = '';
+  bytes.forEach(b => bin += String.fromCharCode(b));
+  return btoa(bin);
+}
 
 export default function Login() {
   const navigate = useNavigate();
+  const { login } = useAuth();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [focused, setFocused] = useState(null);
+  const [error, setError] = useState('');
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  async function handleLogin() {
+    setError('');
+    if (!email || !password) { setError('Please enter email and password'); return; }
+    setIsSubmitting(true);
+    try {
+      await login(email, password);
+      navigate('/dashboard', { replace: true });
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  async function handlePasskey() {
+    setError('');
+    if (!email) { setError('Enter your email first to use a passkey'); return; }
+    try {
+      const beginRes = await fetch('/api/auth/webauthn/login/begin', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ email }),
+      });
+      if (!beginRes.ok) {
+        const err = await beginRes.json();
+        throw new Error(err.error || 'Passkey login unavailable');
+      }
+      const opts = await beginRes.json();
+      const pubKey = {
+        ...opts,
+        challenge: b64toUint(opts.challenge).buffer,
+        allowCredentials: opts.allowCredentials?.map(c => ({
+          ...c, id: b64toUint(c.id).buffer,
+        })),
+      };
+      const cred = await navigator.credentials.get({ publicKey: pubKey });
+      const completeRes = await fetch('/api/auth/webauthn/login/complete', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({
+          id: cred.id,
+          response: {
+            clientDataJSON: uintToB64(cred.response.clientDataJSON),
+            authenticatorData: uintToB64(cred.response.authenticatorData),
+            signature: uintToB64(cred.response.signature),
+            userHandle: cred.response.userHandle ? uintToB64(cred.response.userHandle) : null,
+          },
+        }),
+      });
+      const result = await completeRes.json();
+      if (!completeRes.ok) throw new Error(result.error || 'Passkey verification failed');
+      navigate('/dashboard', { replace: true });
+    } catch (e) {
+      if (e.name === 'NotAllowedError') return;
+      setError(e.message);
+    }
+  }
+
   return (
     <div style={{ position: 'relative', minHeight: '100vh', overflow: 'hidden', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '24px' }}>
       <div style={{ position: 'absolute', inset: 0, zIndex: 0, pointerEvents: 'none' }}>
@@ -23,17 +97,19 @@ export default function Login() {
           <p className="text-muted small" style={{ fontSize: '0.75rem' }}>Sign in to your VaultTrack account</p>
         </div>
         <div style={{ position: 'relative', marginBottom: '18px' }}>
-          <input className="form-control" type="email" value={email} onChange={e => setEmail(e.target.value)} onFocus={() => setFocused('email')} onBlur={() => setFocused(null)} placeholder=" " style={{ width: '100%', height: '52px', padding: '18px 36px 6px 14px', fontSize: '0.85rem', backgroundColor: 'transparent', border: '1px solid rgba(128,128,128,0.2)', borderRadius: '12px', color: 'inherit', outline: 'none', transition: 'border-color 0.2s, box-shadow 0.2s', boxShadow: focused === 'email' ? '0 0 0 2px rgba(245,158,11,0.25)' : 'none', borderColor: focused === 'email' ? '#f59e0b' : 'rgba(128,128,128,0.2)' }} />
+          <input className="form-control" type="email" value={email} onChange={e => { setEmail(e.target.value); setError(''); }} onFocus={() => setFocused('email')} onBlur={() => setFocused(null)} placeholder=" " style={{ width: '100%', height: '52px', padding: '18px 36px 6px 14px', fontSize: '0.85rem', backgroundColor: 'transparent', border: '1px solid rgba(128,128,128,0.2)', borderRadius: '12px', color: 'inherit', outline: 'none', transition: 'border-color 0.2s, box-shadow 0.2s', boxShadow: focused === 'email' ? '0 0 0 2px rgba(245,158,11,0.25)' : 'none', borderColor: focused === 'email' ? '#f59e0b' : 'rgba(128,128,128,0.2)' }} />
           <span style={{ position: 'absolute', left: '14px', top: (focused === 'email' || email) ? '6px' : '50%', transform: (focused === 'email' || email) ? 'translateY(0)' : 'translateY(-50%)', fontSize: (focused === 'email' || email) ? '0.6rem' : '0.8rem', color: focused === 'email' ? '#f59e0b' : 'var(--text-muted)', transition: 'all 0.2s ease', pointerEvents: 'none', fontWeight: (focused === 'email' || email) ? 600 : 400, lineHeight: 1.2 }}>Email Address</span>
           {email && email.includes('@') && <CheckCircle size={14} style={{ position: 'absolute', right: '12px', top: '50%', transform: 'translateY(-50%)', color: '#10b981', pointerEvents: 'none' }} />}
         </div>
         <div style={{ position: 'relative', marginBottom: '18px' }}>
-          <input className="form-control" type={showPassword ? 'text' : 'password'} value={password} onChange={e => setPassword(e.target.value)} onFocus={() => setFocused('password')} onBlur={() => setFocused(null)} placeholder=" " style={{ width: '100%', height: '52px', padding: '18px 36px 6px 14px', fontSize: '0.85rem', backgroundColor: 'transparent', border: '1px solid rgba(128,128,128,0.2)', borderRadius: '12px', color: 'inherit', outline: 'none', transition: 'border-color 0.2s, box-shadow 0.2s', boxShadow: focused === 'password' ? '0 0 0 2px rgba(245,158,11,0.25)' : 'none', borderColor: focused === 'password' ? '#f59e0b' : 'rgba(128,128,128,0.2)' }} />
+          <input className="form-control" type={showPassword ? 'text' : 'password'} value={password} onChange={e => { setPassword(e.target.value); setError(''); }} onFocus={() => setFocused('password')} onBlur={() => setFocused(null)} placeholder=" " style={{ width: '100%', height: '52px', padding: '18px 36px 6px 14px', fontSize: '0.85rem', backgroundColor: 'transparent', border: '1px solid rgba(128,128,128,0.2)', borderRadius: '12px', color: 'inherit', outline: 'none', transition: 'border-color 0.2s, box-shadow 0.2s', boxShadow: focused === 'password' ? '0 0 0 2px rgba(245,158,11,0.25)' : 'none', borderColor: focused === 'password' ? '#f59e0b' : 'rgba(128,128,128,0.2)' }} />
           <span style={{ position: 'absolute', left: '14px', top: (focused === 'password' || password) ? '6px' : '50%', transform: (focused === 'password' || password) ? 'translateY(0)' : 'translateY(-50%)', fontSize: (focused === 'password' || password) ? '0.6rem' : '0.8rem', color: focused === 'password' ? '#f59e0b' : 'var(--text-muted)', transition: 'all 0.2s ease', pointerEvents: 'none', fontWeight: (focused === 'password' || password) ? 600 : 400, lineHeight: 1.2 }}>Password</span>
           <div onClick={() => setShowPassword(!showPassword)} style={{ position: 'absolute', right: '12px', top: '50%', transform: 'translateY(-50%)', cursor: 'pointer', color: password.length >= 8 ? '#10b981' : 'var(--text-muted)', opacity: 0.5 }}>{showPassword ? <EyeOff size={14} /> : <Eye size={14} />}</div>
         </div>
-        <button className="landing-glow-btn w-100 justify-content-center mb-2" onClick={() => navigate('/dashboard')}>Sign In</button>
+        {error && <div style={{ color: '#ef4444', fontSize: '0.75rem', textAlign: 'center', marginBottom: '12px', padding: '6px 12px', backgroundColor: 'rgba(239,68,68,0.1)', borderRadius: '8px' }}>{error}</div>}
+        <button type="button" className="landing-glow-btn w-100 justify-content-center mb-2" onClick={handleLogin} disabled={isSubmitting} style={{ opacity: isSubmitting ? 0.6 : 1 }}>{isSubmitting ? 'Signing in…' : 'Sign In'}</button>
         <button style={{ width: '100%', padding: '11px', borderRadius: '12px', backgroundColor: 'rgba(255,255,255,0.04)', border: '1px solid rgba(128,128,128,0.12)', backdropFilter: 'blur(8px)', color: 'inherit', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px', cursor: 'pointer', transition: 'all 0.3s', marginBottom: '18px', fontSize: '0.8rem', fontWeight: 500 }}
+          onClick={handlePasskey}
           onMouseEnter={e => { e.target.style.borderColor = 'rgba(245,158,11,0.4)'; e.target.style.boxShadow = '0 0 12px rgba(245,158,11,0.12)'; }}
           onMouseLeave={e => { e.target.style.borderColor = 'rgba(128,128,128,0.12)'; e.target.style.boxShadow = 'none'; }}>
           <Fingerprint size={17} />

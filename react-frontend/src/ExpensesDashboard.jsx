@@ -575,7 +575,19 @@ export default function ExpensesDashboard({ wallet, setWallet, showToast, effect
   };
 
   const { summary, breakdown: backendBreakdown, transactions, categories, months } = data || {};
-  const effectiveSpentTotal = summary?.total_expenses || 0;
+  const effectiveSpentTotal = useMemo(() => {
+    if (!transactions || transactions.length === 0) return 0;
+    return transactions
+      .filter(t => {
+        if (selectedMonth === 'All') return true;
+        return t.transaction_date?.startsWith(selectedMonth);
+      })
+      .reduce((sum, t) => {
+        const rawCat = (t.category_name || '').toLowerCase();
+        if (rawCat === 'internal transfer' || rawCat === 'savings deposit' || rawCat === 'withdraw' || rawCat === 'add') return sum;
+        return sum + (Number(t.amount) || 0);
+      }, 0);
+  }, [transactions, selectedMonth]);
   const cashBalance = useMemo(() => {
     if (!transactions) return 0;
     const withdrawals = transactions.filter(t => cashWithdrawalTxns[t.id]).reduce((s, t) => s + (Number(t.amount) || 0), 0);
